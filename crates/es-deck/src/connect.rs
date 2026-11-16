@@ -128,6 +128,21 @@ impl ConnectPanel {
         self.saved.iter().any(|c| c.name == name)
     }
 
+    /// Saved connection names, most recently used first.
+    pub fn names(&self) -> Vec<String> {
+        self.saved.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// Connects to a saved connection with its keychain secret, without the dialog; a failure is
+    /// shown as a notification.
+    pub fn switch_to(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conn) = self.saved.iter().find(|c| c.name == name).cloned() else {
+            return;
+        };
+        self.fill(&conn, window, cx);
+        self.start(conn, String::new(), true, window, cx);
+    }
+
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text =
             |s: &Entity<InputState>, cx: &Context<Self>| s.read(cx).value().trim().to_string();
@@ -142,6 +157,19 @@ impl ConnectPanel {
             timeout_secs: text(&self.timeout, cx).parse().unwrap_or(0),
         };
         let typed = self.secret.read(cx).value().to_string();
+        self.start(conn, typed, false, window, cx);
+    }
+
+    /// Connects in the background. `quiet` means no dialog is open, so a failure is pushed as a
+    /// notification instead of shown in the form.
+    fn start(
+        &mut self,
+        conn: Connection,
+        typed: String,
+        quiet: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let path = self.path.clone();
         self.busy = true;
         self.failure = None;
@@ -179,7 +207,12 @@ impl ConnectPanel {
                     Ok((done, saved)) => {
                         this.saved = saved;
                         cx.emit(done);
-                        window.close_dialog(cx);
+                        if !quiet {
+                            window.close_dialog(cx);
+                        }
+                    }
+                    Err(e) if quiet => {
+                        window.push_notification(format!("Could not connect. {e}"), cx)
                     }
                     Err(e) => this.failure = Some(format!("Could not connect. {e}").into()),
                 }
@@ -420,10 +453,9 @@ fn prepare(
     let config = conn.config(secret).map_err(show)?;
     let client = Client::new(config).map_err(show)?;
     let mut saved = connection::load(path).map_err(show)?;
-    match saved.iter_mut().find(|c| c.name == conn.name) {
-        Some(c) => *c = conn.clone(),
-        None => saved.push(conn.clone()),
-    }
+    // The newest connection goes first: the form and the switcher default to the last one used.
+    saved.retain(|c| c.name != conn.name);
+    saved.insert(0, conn.clone());
     connection::save(path, &saved).map_err(show)?;
     Ok((client, saved))
 }
