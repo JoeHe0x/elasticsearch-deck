@@ -7,14 +7,14 @@ use es_dsl_core::{Token, block_spans, tokens};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{
     EditorState, GutterDecoration, GutterDecorationCollection, RangeDecoration,
-    RangeDecorationCollection, TextDecoration, TextDecorationCollection,
+    RangeDecorationCollection, RangeDecorationStyle, TextDecoration, TextDecorationCollection,
 };
 use gpui_kit::{App, Entity, FontWeight, HighlightStyle};
 
 pub struct Paint {
     colors: TextDecorationCollection,
     bars: GutterDecorationCollection,
-    /// A frame around the request the cursor is in.
+    /// A tint behind the request the cursor is in.
     active: RangeDecorationCollection,
 }
 
@@ -30,7 +30,7 @@ impl Paint {
     /// Recomputes every span; call after each edit (the ranges would follow edits, but not re-classify).
     pub fn refresh(&self, text: &str, cx: &mut App) {
         let theme = cx.theme();
-        let (primary, muted) = (theme.primary, theme.muted_foreground);
+        let (accent, muted) = (theme.blue, theme.muted_foreground);
         let style = |token| {
             let color = match token {
                 Token::Method => theme.magenta,
@@ -53,16 +53,21 @@ impl Paint {
             .collect();
         let bars = block_spans(text)
             .into_iter()
-            .map(|range| GutterDecoration::new(range).with_color(primary))
+            .map(|range| GutterDecoration::new(range).with_color(accent))
             .collect();
         self.colors.set(colors, cx);
         self.bars.set(bars, cx);
     }
 
-    /// Frames `block`, or clears the frame. Callers skip unchanged ranges: setting notifies the editor.
+    /// Tints `block`, or clears the tint. Callers skip unchanged ranges: setting notifies the editor.
+    /// A fill, not the default frame: a frame around a multi-line range is a stepped outline.
     pub fn set_active(&self, block: Option<Range<usize>>, cx: &mut App) {
-        let primary = cx.theme().primary;
-        let frame = block.map(|r| RangeDecoration::new(r).with_color(primary));
-        self.active.set(frame.into_iter().collect(), cx);
+        let tint = cx.theme().blue.opacity(0.08);
+        let fill = block.map(|r| {
+            RangeDecoration::new(r)
+                .with_style(RangeDecorationStyle::Fill)
+                .with_color(tint)
+        });
+        self.active.set(fill.into_iter().collect(), cx);
     }
 }
