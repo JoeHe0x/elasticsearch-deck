@@ -7,14 +7,14 @@ use es_dsl_core::{Token, block_spans, tokens};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{
     EditorState, GutterDecoration, GutterDecorationCollection, RangeDecoration,
-    RangeDecorationCollection, RangeDecorationStyle, TextDecoration, TextDecorationCollection,
+    RangeDecorationCollection, TextDecoration, TextDecorationCollection,
 };
 use gpui_kit::{App, Entity, FontWeight, HighlightStyle};
 
 pub struct Paint {
     colors: TextDecorationCollection,
     bars: GutterDecorationCollection,
-    /// A tint behind the request the cursor is in.
+    /// A frame around the request the cursor is in.
     active: RangeDecorationCollection,
 }
 
@@ -59,15 +59,11 @@ impl Paint {
         self.bars.set(bars, cx);
     }
 
-    /// Tints `block`, or clears the tint. Callers skip unchanged ranges: setting notifies the editor.
-    /// A fill, not the default frame: a frame around a multi-line range is a stepped outline.
+    /// Frames `block`, or clears the frame. Callers skip unchanged ranges: setting notifies the editor.
+    /// The accent color, softened: the default frame color is the editor foreground, which is near black.
     pub fn set_active(&self, block: Option<Range<usize>>, cx: &mut App) {
-        let tint = cx.theme().blue.opacity(0.08);
-        let fill = block.map(|r| {
-            RangeDecoration::new(r)
-                .with_style(RangeDecorationStyle::Fill)
-                .with_color(tint)
-        });
-        self.active.set(fill.into_iter().collect(), cx);
+        let color = cx.theme().blue.opacity(0.6);
+        let frame = block.map(|r| RangeDecoration::new(r).with_color(color));
+        self.active.set(frame.into_iter().collect(), cx);
     }
 }
