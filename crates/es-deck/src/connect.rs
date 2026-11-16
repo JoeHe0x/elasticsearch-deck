@@ -54,7 +54,10 @@ pub struct ConnectPanel {
 
 impl ConnectPanel {
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let saved = connection::load(&path).unwrap_or_default();
+        let (saved, unreadable) = match connection::load(&path) {
+            Ok(saved) => (saved, None),
+            Err(e) => (Vec::new(), Some(SharedString::from(e.to_string()))),
+        };
         let input = |hint: &str, window: &mut Window, cx: &mut Context<Self>| {
             let hint = hint.to_string();
             cx.new(|cx| InputState::new(window, cx).placeholder(hint))
@@ -78,6 +81,7 @@ impl ConnectPanel {
             Some(first) => panel.fill(&first, window, cx),
             None => panel.fill(&Connection::default(), window, cx),
         }
+        panel.failure = unreadable;
         panel
     }
 
@@ -244,6 +248,7 @@ impl ConnectPanel {
             .flex_col()
             .gap_1()
             .w_48()
+            .flex_none()
             .child(
                 Button::new("new-connection")
                     .outline()
@@ -261,7 +266,14 @@ impl ConnectPanel {
                 Button::new(("saved", row_id(&c.name)))
                     .ghost()
                     .selected(c.name == current)
-                    .label(c.name.clone())
+                    .w_full()
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_left()
+                            .child(SharedString::from(c.name.clone())),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.fill(&target, window, cx);
                     }))

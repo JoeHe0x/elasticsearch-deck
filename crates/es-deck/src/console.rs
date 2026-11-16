@@ -833,7 +833,8 @@ impl Console {
             panel.update(cx, |p, cx| p.start_new(copy, window, cx));
         }
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("Connections").child(panel.clone())
+            // The list (12rem) plus the form need more than the default 448px, or the two squeeze together.
+            dialog.title("Connections").w(px(720.)).child(panel.clone())
         });
     }
 
@@ -1038,7 +1039,7 @@ impl Console {
                         let console = cx.entity();
                         window.open_dialog(cx, move |dialog, _, _| {
                             let console = console.clone();
-                            dialog.title("History").child(
+                            dialog.title("History").w(px(640.)).child(
                                 div()
                                     .flex()
                                     .flex_col()

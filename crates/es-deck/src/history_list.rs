@@ -3,7 +3,7 @@
 use es_client::history::Entry;
 use gpui_kit::component::IndexPath;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
-use gpui_kit::{App, Context, ParentElement as _, SharedString, Task, Window, div};
+use gpui_kit::{App, Context, ParentElement as _, SharedString, Styled as _, Task, Window, div};
 
 use crate::connect::row_id;
 
@@ -73,7 +73,12 @@ impl ListDelegate for HistoryList {
         Some(
             ListItem::new(("history", row_id(&key)))
                 .selected(self.selected == Some(ix))
-                .child(div().child(SharedString::from(format!("{} {}", e.method, e.path)))),
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .child(SharedString::from(format!("{} {}", e.method, e.path))),
+                ),
         )
     }
 
