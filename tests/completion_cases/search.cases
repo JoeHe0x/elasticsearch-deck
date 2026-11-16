@@ -1,0 +1,68 @@
+# top-level search keys (search API reference)
+GET idx/_search
+{"|
+has: query aggs sort size from _source highlight track_total_hits
+---
+# query variants (query DSL reference)
+GET idx/_search
+{"query": {"|
+has: bool match match_all term terms range exists prefix wildcard multi_match
+---
+# bool clauses (bool query docs)
+GET idx/_search
+{"query": {"bool": {"|
+has: must filter should must_not minimum_should_match
+---
+# bool must array element
+GET idx/_search
+{"query": {"bool": {"must": [{"|
+has: match term range
+---
+# match takes a field name from the mapping
+GET idx/_search
+{"query": {"match": {"|
+has: title price
+---
+# range bound keys
+GET idx/_search
+{"query": {"range": {"price": {"|
+has: gte lte gt lt
+---
+# match_all is an empty object
+GET idx/_search
+{"query": {"match_all": {"|
+lacks: query bool
+---
+# sort order values
+GET idx/_search
+{"sort": [{"price": {"order": "|
+has: asc desc
+---
+# aggregation names are free, kinds are known
+GET idx/_search
+{"aggs": {"by_user": {"|
+has: terms avg sum date_histogram aggs
+---
+# terms agg params
+GET idx/_search
+{"aggs": {"by_user": {"terms": {"|
+has: field size order
+---
+# highlight fields are mapping fields
+GET idx/_search
+{"highlight": {"fields": {"|
+has: title
+---
+# query string params
+GET idx/_search?|
+has: size from timeout
+---
+# _source filtering
+GET idx/_search
+{"_source": {"|
+has: includes excludes
+---
+# knn search
+GET idx/_search
+{"knn": {"|
+has: field query_vector k num_candidates

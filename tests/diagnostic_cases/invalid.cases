@@ -1,0 +1,29 @@
+# misspelled top-level and query keys
+GET logs/_search
+{"qeury": {}, "query": {"bool": {"shuld": []}}}
+warns: Unknown property `qeury`
+warns: Unknown property `shuld`
+---
+# unknown endpoint
+GET logs/_serch
+warns: No endpoint matches
+---
+# unknown query parameter
+GET logs/_search?pretty&sise=3
+warns: Unknown parameter `sise`
+---
+# broken JSON
+GET logs/_search
+{"size": }
+warns: expected value
+---
+# unknown bulk action key
+POST _bulk
+{"indx": {}}
+{"a": 1}
+warns: Unknown property `indx`
+---
+# unknown key inside a mapping property
+PUT a
+{"mappings": {"properties": {"t": {"typ": "text"}}}}
+warns: Unknown property `typ`

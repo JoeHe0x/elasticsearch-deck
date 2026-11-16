@@ -1,0 +1,111 @@
+# search with bool, range, sort, source (search API reference)
+GET logs/_search
+{
+  "query": {"bool": {"must": [{"match": {"message": "error"}}], "filter": [{"range": {"@timestamp": {"gte": "now-1d/d"}}}], "must_not": {"term": {"level": "debug"}}, "should": [], "minimum_should_match": 1}},
+  "sort": [{"@timestamp": {"order": "desc"}}, "_score"],
+  "_source": ["a", "b"],
+  "size": 10,
+  "from": 0,
+  "track_total_hits": true
+}
+clean
+---
+# aggregations with sub-aggregations (aggregations reference)
+GET logs/_search
+{
+  "size": 0,
+  "aggs": {
+    "by_host": {"terms": {"field": "host.keyword", "size": 5}, "aggs": {"avg_t": {"avg": {"field": "took"}}}},
+    "per_day": {"date_histogram": {"field": "@timestamp", "calendar_interval": "day"}}
+  }
+}
+clean
+---
+# highlight and collapse
+GET logs/_search
+{"query": {"match_phrase": {"message": "x"}}, "highlight": {"fields": {"message": {}}, "pre_tags": ["<b>"]}, "collapse": {"field": "user"}}
+clean
+---
+# multi_match, query_string, nested, exists
+POST logs/_search
+{"query": {"bool": {"should": [{"multi_match": {"query": "x", "fields": ["a^2", "b"], "type": "best_fields"}}, {"query_string": {"query": "a:b"}}, {"nested": {"path": "c", "query": {"exists": {"field": "c.d"}}}}]}}}
+clean
+---
+# index creation with settings and mappings (create index API)
+PUT my-index
+{"settings": {"number_of_shards": 1, "index": {"refresh_interval": "1s"}}, "mappings": {"properties": {"title": {"type": "text"}, "tags": {"type": "keyword"}, "loc": {"type": "geo_point"}}}, "aliases": {"a": {}}}
+clean
+---
+# update with doc (update API)
+POST my-index/_update/1
+{"doc": {"a": 1}, "doc_as_upsert": true}
+clean
+---
+# update with script
+POST my-index/_update/1
+{"script": {"source": "ctx._source.a += params.n", "lang": "painless", "params": {"n": 1}}}
+clean
+---
+# bulk (bulk API)
+POST _bulk
+{"index": {"_index": "t", "_id": "1"}}
+{"field1": "value1"}
+{"delete": {"_index": "t", "_id": "2"}}
+{"create": {"_index": "t", "_id": "3"}}
+{"field1": "value3"}
+{"update": {"_id": "1", "_index": "t"}}
+{"doc": {"field2": "value2"}}
+clean
+---
+# msearch (multi search API)
+GET _msearch
+{"index": "t"}
+{"query": {"match_all": {}}, "size": 1}
+{}
+{"query": {"term": {"a": "b"}}}
+clean
+---
+# analyze
+POST _analyze
+{"analyzer": "standard", "text": "Hello world"}
+clean
+---
+# reindex
+POST _reindex
+{"source": {"index": "a", "query": {"term": {"x": 1}}}, "dest": {"index": "b"}}
+clean
+---
+# delete by query
+POST a/_delete_by_query
+{"query": {"match_all": {}}}
+clean
+---
+# index template
+PUT _index_template/t
+{"index_patterns": ["a-*"], "template": {"settings": {"number_of_shards": 1}, "mappings": {"properties": {"a": {"type": "keyword"}}}}, "priority": 10, "composed_of": []}
+clean
+---
+# count and explain
+POST a/_count
+{"query": {"match_all": {}}}
+clean
+---
+# knn search
+POST a/_search
+{"knn": {"field": "vec", "query_vector": [0.1, 0.2], "k": 5, "num_candidates": 50}, "_source": false}
+clean
+---
+# pipeline
+PUT _ingest/pipeline/p
+{"description": "d", "processors": [{"set": {"field": "a", "value": 1}}, {"rename": {"field": "b", "target_field": "c"}}]}
+clean
+---
+# runtime mappings, script fields, post_filter
+GET a/_search
+{"runtime_mappings": {"d": {"type": "keyword", "script": {"source": "emit(1)"}}}, "script_fields": {"x": {"script": {"source": "1"}}}, "post_filter": {"term": {"a": 1}}, "fields": ["*"]}
+clean
+---
+# sort by script and search_after, pit
+GET a/_search
+{"pit": {"id": "x", "keep_alive": "1m"}, "search_after": [1, "a"], "sort": [{"_script": {"type": "number", "script": {"source": "1"}, "order": "asc"}}]}
+clean

@@ -1,0 +1,90 @@
+# method names
+P|
+has: POST PUT
+---
+# endpoint paths
+GET _cat/|
+has: indices health
+---
+# create index
+PUT idx
+{"|
+has: settings mappings aliases
+---
+# index settings
+PUT idx
+{"settings": {"|
+has: number_of_shards number_of_replicas
+---
+# put mapping
+PUT idx/_mapping
+{"|
+has: properties dynamic
+---
+# mapping property types
+PUT idx/_mapping
+{"properties": {"title": {"type": "|
+has: text keyword long date
+---
+# reindex
+POST _reindex
+{"|
+has: source dest script
+---
+# update by query
+POST idx/_update_by_query
+{"|
+has: query script
+---
+# analyze
+POST _analyze
+{"|
+has: analyzer text tokenizer filter
+---
+# bulk action lines
+POST _bulk
+{"|
+has: index create update delete
+---
+# bulk index payload is a free document
+POST _bulk
+{"index": {"_index": "idx"}}
+{"|
+none:
+---
+# bulk update payload
+POST _bulk
+{"update": {"_id": "1"}}
+{"|
+has: doc doc_as_upsert script upsert
+---
+# msearch alternates header and body
+POST idx/_msearch
+{}
+{"|
+has: query size aggs
+---
+# msearch header
+POST idx/_msearch
+{"|
+has: index preference
+---
+# count
+POST idx/_count
+{"|
+has: query
+---
+# index a document is free form
+POST idx/_doc
+{"|
+none:
+---
+# update API
+POST idx/_update/1
+{"|
+has: doc script upsert doc_as_upsert
+---
+# aliases
+POST _aliases
+{"actions": [{"|
+has: add remove remove_index
