@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn marks_the_typed_letters_in_order() {
-        assert_eq!(marked("scr", "_score"), [1, 2, 5]);
+        assert_eq!(marked("scr", "_score"), [1, 2, 4]);
         assert_eq!(marked("MUST", "must_not"), [0, 1, 2, 3]);
         assert!(marked("zz", "must").is_empty());
         assert!(marked("", "must").is_empty());
