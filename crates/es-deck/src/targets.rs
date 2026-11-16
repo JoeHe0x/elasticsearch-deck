@@ -3,7 +3,9 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IndexPath, Sizable as _};
-use gpui_kit::{App, Context, ParentElement as _, SharedString, Styled as _, Task, Window, div};
+use gpui_kit::{
+    App, Context, ParentElement as _, SharedString, Styled as _, Task, Window, div, rems,
+};
 
 use crate::connect::row_id;
 
@@ -223,9 +225,26 @@ impl ListDelegate for Targets {
         _: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let muted = cx.theme().muted_foreground;
+        let theme = cx.theme();
+        let (muted, radius) = (theme.muted_foreground, theme.radius);
+        // Painted on the inner row, not the item: the item's hover color would otherwise cover it
+        // right after a click, when the pointer is still on the row.
+        let selected = theme.blue.opacity(0.16);
+        let chosen = self.selected == Some(ix);
         let line = *self.lines.get(ix.row)?;
-        let row = div().flex().items_center().gap_1p5().min_w_0();
+        let row = move || {
+            let row = div()
+                .w_full()
+                .h(rems(1.75))
+                .px_2()
+                .rounded(radius)
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .min_w_0();
+            if chosen { row.bg(selected) } else { row }
+        };
+        let item = |id: (&'static str, usize)| ListItem::new(id).p_0().rounded(radius).text_sm();
         Some(match line {
             Line::Folder(slot) => {
                 let open = self.is_open(slot);
@@ -245,8 +264,9 @@ impl ListDelegate for Targets {
                     .small()
                     .text_color(muted)
                 }));
-                ListItem::new(("tree-folder", slot)).child(
-                    row.child(chevron)
+                item(("tree-folder", slot)).child(
+                    row()
+                        .child(chevron)
                         .child(Icon::new(icon).small().text_color(muted))
                         .child(
                             div()
@@ -266,14 +286,13 @@ impl ListDelegate for Targets {
             Line::Item(slot, i) => {
                 let label = self.shown[slot].get(i)?.label.clone();
                 let id = row_id(&format!("{slot}/{label}"));
-                ListItem::new(("tree-item", id))
-                    .selected(self.selected == Some(ix))
-                    .child(
-                        // Indented under the folder's icon, past its chevron.
-                        row.pl_9()
-                            .child(Icon::new(FOLDERS[slot].icon()).small().text_color(muted))
-                            .child(div().truncate().child(SharedString::from(label))),
-                    )
+                item(("tree-item", id as usize)).child(
+                    // Indented under the folder's icon, past its chevron.
+                    row()
+                        .pl_9()
+                        .child(Icon::new(FOLDERS[slot].icon()).small().text_color(muted))
+                        .child(div().truncate().child(SharedString::from(label))),
+                )
             }
         })
     }
