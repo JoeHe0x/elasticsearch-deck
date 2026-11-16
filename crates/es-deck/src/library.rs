@@ -1,0 +1,174 @@
+//! Saved items and request history, shared by every tab: both live in files, so one copy in memory
+//! keeps two tabs from overwriting each other. Tabs observe it and refresh their own lists.
+
+use std::path::PathBuf;
+
+use es_client::history::{self, Entry};
+use es_client::saved::{self, Kind, Saved};
+use gpui_kit::{AppContext as _, Context, EventEmitter};
+
+pub struct Library {
+    saved: Vec<Saved>,
+    saved_path: PathBuf,
+    history: Vec<Entry>,
+    history_path: PathBuf,
+}
+
+/// What changed, so a tab refreshes only the list that depends on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Changed {
+    Saved,
+    History,
+}
+
+impl EventEmitter<Changed> for Library {}
+
+impl Library {
+    /// `dir_file` is any file in the config directory; the two files live next to it.
+    pub fn load(dir_file: &std::path::Path) -> Self {
+        let saved_path = dir_file.with_file_name("saved.json");
+        let history_path = dir_file.with_file_name("history.json");
+        Self {
+            // An unreadable file was moved aside by `load`; starting empty cannot overwrite it.
+            saved: history::load(&saved_path).unwrap_or_default(),
+            history: history::load(&history_path).unwrap_or_default(),
+            saved_path,
+            history_path,
+        }
+    }
+
+    /// Empty, with files under the temp directory, so a test never reads or writes real ones.
+    #[cfg(test)]
+    pub fn blank() -> Self {
+        let dir = std::env::temp_dir().join("esdeck-blank-library");
+        Self {
+            saved: Vec::new(),
+            saved_path: dir.join("saved.json"),
+            history: Vec::new(),
+            history_path: dir.join("history.json"),
+        }
+    }
+
+    /// The saved items of one connection and kind, in saving order.
+    pub fn saved(&self, connection: &str, kind: Kind) -> impl Iterator<Item = &Saved> {
+        let connection = connection.to_string();
+        self.saved
+            .iter()
+            .filter(move |s| s.connection == connection && s.kind == kind)
+    }
+
+    /// The history of one connection, in recording order.
+    pub fn history(&self, connection: &str) -> Vec<Entry> {
+        self.history
+            .iter()
+            .filter(|e| e.connection == connection)
+            .cloned()
+            .collect()
+    }
+
+    /// Returns false when `item` was refused: empty, or it may hold credentials.
+    pub fn add_saved(&mut self, item: Saved, cx: &mut Context<Self>) -> bool {
+        let added = saved::add(&mut self.saved, item);
+        if added {
+            self.persist_saved(cx);
+        }
+        added
+    }
+
+    pub fn remove_saved(
+        &mut self,
+        connection: &str,
+        kind: Kind,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.saved.retain(|s| {
+            (s.connection.as_str(), s.kind, s.text.as_str()) != (connection, kind, text)
+        });
+        self.persist_saved(cx);
+    }
+
+    pub fn rename_saved(
+        &mut self,
+        connection: &str,
+        kind: Kind,
+        text: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if saved::rename(&mut self.saved, connection, kind, text, name) {
+            self.persist_saved(cx);
+        }
+    }
+
+    pub fn record(&mut self, entry: Entry, cx: &mut Context<Self>) {
+        if history::record(&mut self.history, entry) {
+            self.persist_history(cx);
+        }
+    }
+
+    pub fn clear_history(&mut self, connection: &str, cx: &mut Context<Self>) {
+        self.history.retain(|e| e.connection != connection);
+        self.persist_history(cx);
+    }
+
+    fn persist_saved(&mut self, cx: &mut Context<Self>) {
+        let (path, items) = (self.saved_path.clone(), self.saved.clone());
+        // A failed write only loses this session's saves.
+        cx.background_spawn(async move {
+            let _ = history::save(&path, &items);
+        })
+        .detach();
+        cx.emit(Changed::Saved);
+    }
+
+    fn persist_history(&mut self, cx: &mut Context<Self>) {
+        let (path, entries) = (self.history_path.clone(), self.history.clone());
+        // A failed write only loses this session's history; the request itself already ran.
+        cx.background_spawn(async move {
+            let _ = history::save(&path, &entries);
+        })
+        .detach();
+        cx.emit(Changed::History);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::TestAppContext;
+
+    fn item(connection: &str, text: &str) -> Saved {
+        Saved {
+            connection: connection.into(),
+            kind: Kind::Query,
+            name: saved::name_of(text),
+            text: text.into(),
+            at: 0,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn saved_items_are_scoped_by_connection_and_refuse_credentials(cx: &mut TestAppContext) {
+        let library = cx.new(|_| Library::blank());
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = changes.clone();
+        let _sub = cx
+            .update(|cx| cx.subscribe(&library, move |_, _: &Changed, _| seen.set(seen.get() + 1)));
+        let added = |cx: &mut TestAppContext, c: &str, t: &str| {
+            library.update(cx, |l, cx| l.add_saved(item(c, t), cx))
+        };
+        assert!(added(cx, "a", "GET x/_search"));
+        assert!(added(cx, "b", "GET y/_search"));
+        assert!(
+            !added(cx, "a", "PUT _security/user/u"),
+            "credentials are never kept"
+        );
+        library.read_with(cx, |l, _| {
+            assert_eq!(l.saved("a", Kind::Query).count(), 1);
+            assert_eq!(l.saved("b", Kind::Query).count(), 1);
+        });
+        // Two accepted saves emitted; the refused one did not.
+        assert_eq!(changes.get(), 2);
+    }
+}

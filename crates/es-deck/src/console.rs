@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use es_client::catalog::{Catalog, Item};
-use es_client::history::{self, Entry};
+use es_client::history::Entry;
 use es_client::saved::{self, Kind, Saved};
 use es_client::{Client, Request};
 use es_dsl_core::Index;
@@ -20,6 +20,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::list::{List, ListEvent, ListState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::status_bar::StatusBar;
@@ -30,9 +31,10 @@ use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, Theme, WindowExt as _,
+    scroll::ScrollbarMode,
 };
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight,
+    App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
     Styled as _, Task, Window, actions, div, px, rems,
 };
@@ -41,6 +43,7 @@ use crate::completion::{LspCompletion, LspHover};
 use crate::connect::{ConnectPanel, Connected};
 use crate::history_list::HistoryList;
 use crate::hits_table::HitsTable;
+use crate::library::{Changed, Library};
 use crate::lsp_client::LspClient;
 use crate::paint::Paint;
 use crate::targets::{Folder, Row, Targets, search_text};
@@ -110,6 +113,17 @@ fn tree_item(node: &es_client::Node, open: bool) -> TreeItem {
         .children(node.children.iter().map(|c| tree_item(c, false)))
 }
 
+/// Colors of the response tree, by kind of text.
+#[derive(Clone, Copy)]
+struct TreePalette {
+    key: Hsla,
+    string: Hsla,
+    number: Hsla,
+    keyword: Hsla,
+    muted: Hsla,
+    guide: Hsla,
+}
+
 /// What the toolbar shows about the cluster the console is talking to.
 struct Summary {
     name: SharedString,
@@ -130,14 +144,10 @@ pub struct Console {
     /// The whole last response body, for Save; the viewers may show less.
     full_body: Option<String>,
     targets: Entity<ListState<Targets>>,
-    /// Saved consoles, requests and queries across connections; the tree shows the current one's.
-    saved: Vec<Saved>,
-    saved_path: PathBuf,
+    /// Saved items and history, shared by every tab; the tree and the history list show the current connection's.
+    library: Entity<Library>,
     /// The in-flight catalog read; replaced by the next one.
     catalog: Option<Task<()>>,
-    /// Sent requests in recording order, across connections; the list shows the current one's.
-    history: Vec<Entry>,
-    history_path: PathBuf,
     history_list: Entity<ListState<HistoryList>>,
     view: View,
     /// Blocks every request that would change the cluster; per session, off at start.
@@ -171,6 +181,7 @@ impl Console {
         text: &str,
         index: Index,
         client: Arc<LspClient>,
+        library: Entity<Library>,
         connections: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -233,10 +244,11 @@ impl Console {
         restyle(Some(window), cx);
         cx.observe_window_appearance(window, |_, window, cx| restyle(Some(window), cx))
             .detach();
-        let saved_path = connections.with_file_name("saved.json");
-        let saved = history::load(&saved_path).unwrap_or_default();
-        let history_path = connections.with_file_name("history.json");
-        let history = history::load(&history_path).unwrap_or_default();
+        cx.subscribe(&library, |this, _, ev: &Changed, cx| match ev {
+            Changed::Saved => this.refresh_saved(cx),
+            Changed::History => this.refresh_history(cx),
+        })
+        .detach();
         let history_list =
             cx.new(|cx| ListState::new(HistoryList::default(), window, cx).searchable(true));
         cx.subscribe(&history_list, |this, list, ev: &ListEvent, cx| {
@@ -264,11 +276,8 @@ impl Console {
             tree: None,
             full_body: None,
             targets,
-            saved,
-            saved_path,
+            library,
             catalog: None,
-            history,
-            history_path,
             history_list,
             view: View::Table,
             readonly: false,
@@ -627,12 +636,7 @@ impl Console {
     /// Pushes the current connection's history into the list.
     fn refresh_history(&mut self, cx: &mut Context<Self>) {
         let name = self.connection_name();
-        let mine: Vec<Entry> = self
-            .history
-            .iter()
-            .filter(|e| e.connection == name)
-            .cloned()
-            .collect();
+        let mine = self.library.read(cx).history(&name);
         self.history_list.update(cx, |list, cx| {
             list.delegate_mut().set(mine.into_iter());
             cx.notify();
@@ -650,46 +654,30 @@ impl Console {
             body: req.body.clone(),
             at,
         };
-        if history::record(&mut self.history, entry) {
-            self.save_history(cx);
-            self.refresh_history(cx);
-        }
-    }
-
-    fn save_history(&self, cx: &mut Context<Self>) {
-        let (path, entries) = (self.history_path.clone(), self.history.clone());
-        // A failed write only loses this session's history; the request itself already ran.
-        cx.background_spawn(async move {
-            let _ = history::save(&path, &entries);
-        })
-        .detach();
+        self.library
+            .update(cx, |library, cx| library.record(entry, cx));
     }
 
     fn clear_history(&mut self, cx: &mut Context<Self>) {
         let name = self.connection_name();
-        self.history.retain(|e| e.connection != name);
-        self.save_history(cx);
-        self.refresh_history(cx);
+        self.library
+            .update(cx, |library, cx| library.clear_history(&name, cx));
     }
 
     /// Pushes the current connection's saved items into the tree.
     fn refresh_saved(&mut self, cx: &mut Context<Self>) {
         let name = self.connection_name();
+        let library = self.library.read(cx);
         let rows = |kind: Kind| -> Vec<Row> {
-            self.saved
-                .iter()
-                .filter(|s| s.connection == name && s.kind == kind)
+            library
+                .saved(&name, kind)
                 .map(|s| Row {
                     label: s.name.clone(),
                     text: s.text.clone(),
                 })
                 .collect()
         };
-        let by_kind = [
-            (Folder::Consoles, rows(Kind::Console)),
-            (Folder::Requests, rows(Kind::Request)),
-            (Folder::Queries, rows(Kind::Query)),
-        ];
+        let by_kind = [(Folder::Consoles, rows(Kind::Console))];
         self.targets.update(cx, |list, cx| {
             for (folder, rows) in by_kind {
                 list.delegate_mut().set(folder, rows);
@@ -708,40 +696,12 @@ impl Console {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
         };
-        if !saved::add(&mut self.saved, item) {
+        if !self
+            .library
+            .update(cx, |library, cx| library.add_saved(item, cx))
+        {
             self.fail("Nothing to save, or it touches the security APIs.", cx);
-            return;
         }
-        self.persist_saved(cx);
-    }
-
-    fn persist_saved(&mut self, cx: &mut Context<Self>) {
-        let (path, items) = (self.saved_path.clone(), self.saved.clone());
-        // A failed write only loses this session's saves.
-        cx.background_spawn(async move {
-            let _ = history::save(&path, &items);
-        })
-        .detach();
-        self.refresh_saved(cx);
-    }
-
-    /// Saves the request under the cursor as a request or, for a search, a query.
-    fn save_request(&mut self, cx: &mut Context<Self>) {
-        let editor = self.editor.read(cx);
-        let Some(req) = Request::at(&editor.value(), editor.cursor()) else {
-            self.fail(
-                "No request at the cursor. Put the cursor in a request and try again.",
-                cx,
-            );
-            return;
-        };
-        let text = format!(
-            "{} {}\n{}",
-            req.method,
-            req.path,
-            req.body.unwrap_or_default()
-        );
-        self.store(saved::request_kind(&req.path), text, cx);
     }
 
     fn save_console(&mut self, cx: &mut Context<Self>) {
@@ -755,8 +715,6 @@ impl Console {
         let (folder, row) = targets.delegate().selected()?;
         let kind = match folder {
             Folder::Consoles => Kind::Console,
-            Folder::Requests => Kind::Request,
-            Folder::Queries => Kind::Query,
             _ => return None,
         };
         Some((kind, row.text.clone(), row.label.clone()))
@@ -768,9 +726,9 @@ impl Console {
             return;
         };
         let name = self.connection_name();
-        self.saved
-            .retain(|s| (&s.connection, s.kind, &s.text) != (&name, kind, &text));
-        self.persist_saved(cx);
+        self.library.update(cx, |library, cx| {
+            library.remove_saved(&name, kind, &text, cx)
+        });
     }
 
     /// Asks for a new name for the selected saved item.
@@ -802,15 +760,9 @@ impl Console {
                                         let (console, text) = (console.clone(), text.clone());
                                         console.update(cx, |this, cx| {
                                             let conn = this.connection_name();
-                                            if saved::rename(
-                                                &mut this.saved,
-                                                &conn,
-                                                kind,
-                                                &text,
-                                                &name,
-                                            ) {
-                                                this.persist_saved(cx);
-                                            }
+                                            this.library.update(cx, |library, cx| {
+                                                library.rename_saved(&conn, kind, &text, &name, cx)
+                                            });
                                         });
                                         window.close_dialog(cx);
                                     }
@@ -982,6 +934,8 @@ fn install(state: &mut EditorState, client: &Arc<LspClient>) {
 /// Follows the system appearance, then rounds the theme: a theme load resets the radii.
 fn restyle(window: Option<&mut Window>, cx: &mut App) {
     Theme::sync_system_appearance(window, cx);
+    // The sync picks hover-only scrollbars off macOS; a table or a long request should show that there is more.
+    Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
     Theme::update(cx, |theme| {
         theme.radius = px(8.0);
         theme.radius_lg = px(12.0);
@@ -995,6 +949,7 @@ impl Console {
             .as_ref()
             .map_or("Connect…".into(), |s| s.name.clone());
         let muted = cx.theme().muted_foreground;
+        let console = cx.entity();
         let sending = matches!(self.run, Run::Sending);
         Toolbar::new("console-toolbar")
             .child(
@@ -1101,16 +1056,38 @@ impl Console {
                     .tooltip("Shortcuts")
                     .on_click(cx.listener(|this, _, window, cx| this.show_help(window, cx))),
             )
-            .child(
+            .content({
+                let (panel, current) = (self.panel.clone(), label.to_string());
                 Button::new("connections")
                     .ghost()
                     .icon(IconName::Database)
                     .small()
                     .label(label)
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_connections(None, window, cx)),
-                    ),
-            )
+                    .dropdown_caret(true)
+                    .dropdown_menu(move |menu, _, cx| {
+                        let names = panel.read(cx).names();
+                        let menu = names.into_iter().fold(menu, |menu, name| {
+                            let panel = panel.clone();
+                            let target = name.clone();
+                            menu.item(
+                                PopupMenuItem::new(name.clone())
+                                    .checked(name == current)
+                                    .on_click(move |_, window, cx| {
+                                        panel.update(cx, |p, cx| p.switch_to(&target, window, cx))
+                                    }),
+                            )
+                        });
+                        let console = console.clone();
+                        menu.separator()
+                            .item(PopupMenuItem::new("Manage connections…").on_click(
+                                move |_, window, cx| {
+                                    console.update(cx, |this, cx| {
+                                        this.open_connections(None, window, cx)
+                                    })
+                                },
+                            ))
+                    })
+            })
     }
 
     /// Bottom bar: the outcome of the last request on the left, the document check on the right.
@@ -1169,6 +1146,15 @@ impl Console {
 
     /// The response viewer: view tabs and actions above the body. Only built once a response exists.
     fn render_response(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let palette = TreePalette {
+            key: theme.blue,
+            string: theme.green,
+            number: theme.yellow,
+            keyword: theme.magenta,
+            muted: theme.muted_foreground,
+            guide: theme.border,
+        };
         let mut views = Vec::new();
         if self.hits.is_some() {
             views.push((View::Table, "Table", IconName::Table2));
@@ -1235,7 +1221,7 @@ impl Console {
             .child(
                 div().flex_1().min_h_0().child(match (table, outline) {
                     (Some(t), _) => DataTable::new(t).stripe(true).into_any_element(),
-                    (None, Some(t)) => tree(t, |_, entry, selected, _, _| {
+                    (None, Some(t)) => tree(t, move |_, entry, selected, _, _| {
                         let chevron = if !entry.is_folder() {
                             None
                         } else if entry.is_expanded() {
@@ -1243,23 +1229,61 @@ impl Console {
                         } else {
                             Some(IconName::ChevronRight)
                         };
+                        let label = entry.item().label.to_string();
+                        // shortcut: a key containing ": " is split early, only its colors are off.
+                        let (key, value) = match label.split_once(": ") {
+                            Some((k, v)) => (Some(k.to_string()), v.to_string()),
+                            None => (None, label),
+                        };
+                        let (kind, value_color) = match value.as_bytes().first() {
+                            Some(b'"') => (IconName::Quote, palette.string),
+                            Some(b'{') => (IconName::Braces, palette.muted),
+                            Some(b'[') => (IconName::Brackets, palette.muted),
+                            _ if value == "null" => (IconName::CircleDot, palette.keyword),
+                            _ if value == "true" || value == "false" => {
+                                (IconName::ToggleLeft, palette.keyword)
+                            }
+                            _ => (IconName::Hash, palette.number),
+                        };
                         ListItem::new(SharedString::from(entry.item().id.to_string()))
                             .selected(selected)
-                            .pl(rems(entry.depth() as f32))
+                            .text_sm()
+                            .p_0()
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
+                                    .h(rems(1.75))
                                     .gap_1()
+                                    // One guide line per ancestor level, like an IDE's indent guides.
+                                    .children((0..entry.depth()).map(|_| {
+                                        div()
+                                            .w(rems(1.))
+                                            .h_full()
+                                            .border_l_1()
+                                            .border_color(palette.guide)
+                                    }))
+                                    .child(div().w_1())
                                     .child(match chevron {
-                                        Some(i) => Icon::new(i).size_3().into_any_element(),
+                                        Some(i) => Icon::new(i)
+                                            .size_3()
+                                            .text_color(palette.muted)
+                                            .into_any_element(),
                                         None => div().size_3().into_any_element(),
                                     })
-                                    .child(entry.item().label.clone()),
+                                    .child(Icon::new(kind).size_3().text_color(value_color))
+                                    .children(key.map(|k| {
+                                        div()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(palette.key)
+                                            .child(format!("{k}:"))
+                                    }))
+                                    .child(div().text_color(value_color).child(value)),
                             )
                     })
                     .into_any_element(),
                     (None, None) => Editor::new(&self.response)
+                        .bordered(false)
                         .readonly(true)
                         .h_full()
                         .into_any_element(),
@@ -1303,14 +1327,15 @@ impl Render for Console {
         } else {
             theme.danger
         };
-        let (border, radius, surface) = (theme.border, theme.radius_lg, theme.sidebar);
+        let (border, radius, surface) = (theme.border, theme.radius_lg, theme.background);
+        // Islands: panels float as raised cards on a slightly darker window ground.
+        let ground = theme.background.blend(theme.foreground.opacity(0.09));
         let card = move || {
             div()
                 .size_full()
                 .overflow_hidden()
                 .rounded(radius)
-                .border_1()
-                .border_color(border)
+                .bg(surface)
         };
         let header = div()
             .flex()
@@ -1346,14 +1371,6 @@ impl Render for Console {
             .pt_1()
             .border_t_1()
             .border_color(border)
-            .child(
-                tool(
-                    "save-request",
-                    IconName::Bookmark,
-                    "Save the request at the cursor",
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.save_request(cx))),
-            )
             .child(
                 tool(
                     "save-console",
@@ -1397,11 +1414,20 @@ impl Render for Console {
             .size_full()
             .flex()
             .flex_col()
+            .bg(ground)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Format, window, cx| this.format(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| this.newline(window, cx)))
             .on_action(cx.listener(|this, _: &Accept, window, cx| this.accept(window, cx)))
-            .child(div().p_2().child(self.render_toolbar(cx)))
+            .child(
+                div().p_2().child(
+                    div()
+                        .overflow_hidden()
+                        .rounded(radius)
+                        .bg(surface)
+                        .child(self.render_toolbar(cx)),
+                ),
+            )
             .child(
                 // Panels clip their content and the editors do not wrap, so a narrower panel
                 // hides text instead of reflowing it.
@@ -1415,8 +1441,11 @@ impl Render for Console {
                                 .child(div().size_full().pr_2().child(targets)),
                         )
                         .child(
-                            resizable_panel()
-                                .child(card().child(Editor::new(&self.editor).h_full())),
+                            resizable_panel().child(
+                                card()
+                                    .p_1p5()
+                                    .child(Editor::new(&self.editor).bordered(false).h_full()),
+                            ),
                         )
                         .child(
                             resizable_panel()
@@ -1463,11 +1492,13 @@ mod tests {
         let (window, console) = cx
             .update(|cx| {
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    let library = cx.new(|_| Library::blank());
                     cx.new(|cx| {
                         Console::new(
                             "",
                             sample_index(),
                             client,
+                            library,
                             PathBuf::from("unused.json"),
                             window,
                             cx,
@@ -1518,11 +1549,13 @@ mod tests {
         let (window, console) = cx
             .update(|cx| {
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    let library = cx.new(|_| Library::blank());
                     cx.new(|cx| {
                         Console::new(
                             "",
                             sample_index(),
                             client,
+                            library,
                             PathBuf::from("unused.json"),
                             window,
                             cx,

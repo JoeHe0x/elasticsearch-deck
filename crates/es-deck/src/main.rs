@@ -4,13 +4,14 @@ mod connect;
 mod console;
 mod history_list;
 mod hits_table;
+mod library;
 mod lsp_client;
 mod paint;
 mod targets;
 
 use anyhow::{Context as _, Result};
 use es_dsl_core::{Index, parse_version};
-use gpui_kit::{AppContext as _, WindowOptions};
+use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 
 fn main() -> Result<()> {
     // The index comes from `es-deck-schema`. Without an argument, look next to the working directory,
@@ -54,8 +55,21 @@ fn main() -> Result<()> {
         .run(move |cx| {
             gpui_kit::init(cx);
             console::bind_keys(cx);
-            let opened = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                cx.new(|cx| console::Console::new("", index, client, connections, window, cx))
+            // The default window fills the display or more; ask for a fixed size, centered, that
+            // the platform clamps to the screen.
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1280.), px(800.)),
+                    cx,
+                ))),
+                ..WindowOptions::default()
+            };
+            let opened = gpui_kit::open_window(options, cx, |window, cx| {
+                let library = cx.new(|_| library::Library::load(&connections));
+                cx.new(|cx| {
+                    console::Console::new("", index, client, library, connections, window, cx)
+                })
             });
             if let Err(e) = opened {
                 eprintln!("failed to open window: {e}");

@@ -10,11 +10,14 @@ icon_assets!(
     [
         Bookmark,
         Braces,
+        Brackets,
+        CircleDot,
         CircleQuestionMark,
         Clock,
         Copy,
         Database,
         Download,
+        Hash,
         FileText,
         Folder,
         FolderOpen,
@@ -23,11 +26,13 @@ icon_assets!(
         PanelLeft,
         Pencil,
         Plus,
+        Quote,
         RefreshCw,
         Save,
         Server,
         SquareTerminal,
         Table2,
+        ToggleLeft,
         Trash,
         Unplug
     ]

@@ -12,8 +12,6 @@ use crate::connect::row_id;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Folder {
     Consoles,
-    Requests,
-    Queries,
     Indices,
     Aliases,
     Nodes,
@@ -23,10 +21,8 @@ pub enum Folder {
 }
 
 /// Display order.
-const FOLDERS: [Folder; 9] = [
+const FOLDERS: [Folder; 7] = [
     Folder::Consoles,
-    Folder::Requests,
-    Folder::Queries,
     Folder::Indices,
     Folder::Aliases,
     Folder::Nodes,
@@ -43,8 +39,6 @@ impl Folder {
     fn title(self) -> &'static str {
         match self {
             Self::Consoles => "Consoles",
-            Self::Requests => "Requests",
-            Self::Queries => "Queries",
             Self::Indices => "Indices",
             Self::Aliases => "Aliases",
             Self::Nodes => "Nodes",
@@ -58,19 +52,18 @@ impl Folder {
     fn icon(self) -> IconName {
         match self {
             Self::Consoles => IconName::SquareTerminal,
-            Self::Requests => IconName::Braces,
             Self::Indices => IconName::Table2,
             Self::Aliases => IconName::Link2,
             Self::Nodes => IconName::Server,
             Self::Tasks => IconName::Clock,
             Self::Pipelines => IconName::ListTree,
-            Self::Queries | Self::Templates => IconName::FileText,
+            Self::Templates => IconName::FileText,
         }
     }
 
-    /// The user's own buckets stay listed while empty, so it is visible where saved items go.
+    /// The user's own bucket stays listed while empty, so it is visible where saved items go.
     fn always_shown(self) -> bool {
-        matches!(self, Self::Consoles | Self::Requests | Self::Queries)
+        matches!(self, Self::Consoles)
     }
 }
 
@@ -99,13 +92,13 @@ enum Line {
 /// The tree is one flat list: a folder line followed by its rows while it is open. The kit's list
 /// draws no header for an empty section, so real sections would make a collapsed folder vanish.
 pub struct Targets {
-    all: [Vec<Row>; 9],
+    all: [Vec<Row>; 7],
     query: String,
-    shown: [Vec<Row>; 9],
+    shown: [Vec<Row>; 7],
     lines: Vec<Line>,
     selected: Option<IndexPath>,
     /// Folders the user collapsed, by slot; everything but the indices starts closed.
-    collapsed: [bool; 9],
+    collapsed: [bool; 7],
 }
 
 impl Default for Targets {
@@ -334,18 +327,18 @@ mod tests {
     #[test]
     fn only_folders_with_rows_show_and_only_the_indices_start_open() {
         let mut t = Targets::default();
-        // Only the user's own buckets are listed while empty.
-        assert_eq!(t.lines, [Line::Folder(0), Line::Folder(1), Line::Folder(2)]);
+        // Only the user's own bucket is listed while empty.
+        assert_eq!(t.lines, [Line::Folder(0)]);
         assert!(t.set(Folder::Indices, vec![row("a"), row("b")]));
         assert!(!t.set(Folder::Indices, vec![row("a"), row("b")]));
         assert!(t.set(Folder::Nodes, vec![row("n1")]));
-        // Three buckets, indices open with two rows, nodes closed.
-        assert_eq!(t.lines.len(), 7);
-        assert_eq!(t.activate(at(6)), None, "a folder line toggles");
-        assert_eq!(t.lines.len(), 8, "nodes opened");
-        assert_eq!(t.activate(at(6)), None);
-        assert_eq!(t.lines.len(), 7, "nodes closed again");
-        assert_eq!(t.activate(at(4)), Some((Folder::Indices, "GET a".into())));
+        // Consoles, indices open with two rows, nodes closed.
+        assert_eq!(t.lines.len(), 5);
+        assert_eq!(t.activate(at(4)), None, "a folder line toggles");
+        assert_eq!(t.lines.len(), 6, "nodes opened");
+        assert_eq!(t.activate(at(4)), None);
+        assert_eq!(t.lines.len(), 5, "nodes closed again");
+        assert_eq!(t.activate(at(2)), Some((Folder::Indices, "GET a".into())));
     }
 
     #[test]
@@ -354,17 +347,9 @@ mod tests {
         t.set(Folder::Nodes, vec![row("node-1"), row("other")]);
         t.query = "node".into();
         t.refilter();
-        assert_eq!(t.lines, [Line::Folder(5), Line::Item(5, 0)]);
+        assert_eq!(t.lines, [Line::Folder(3), Line::Item(3, 0)]);
         t.query.clear();
         t.refilter();
-        assert_eq!(
-            t.lines,
-            [
-                Line::Folder(0),
-                Line::Folder(1),
-                Line::Folder(2),
-                Line::Folder(5)
-            ]
-        );
+        assert_eq!(t.lines, [Line::Folder(0), Line::Folder(3)]);
     }
 }
