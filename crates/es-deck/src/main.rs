@@ -11,6 +11,7 @@ mod targets;
 
 use anyhow::{Context as _, Result};
 use es_dsl_core::{Index, parse_version};
+use gpui_kit::component::{GlobalState, TitleBar};
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 
 fn main() -> Result<()> {
@@ -55,6 +56,14 @@ fn main() -> Result<()> {
         .run(move |cx| {
             gpui_kit::init(cx);
             console::bind_keys(cx);
+            // Bindings first, then menus; `AppMenuBar` (Windows and Linux) reads them from the global state.
+            cx.set_menus(console::app_menus());
+            GlobalState::global_mut(cx).set_app_menus(
+                console::app_menus()
+                    .into_iter()
+                    .map(|m| m.owned())
+                    .collect(),
+            );
             // The default window fills the display or more; ask for a fixed size, centered, that
             // the platform clamps to the screen.
             let options = WindowOptions {
@@ -63,7 +72,7 @@ fn main() -> Result<()> {
                     size(px(1280.), px(800.)),
                     cx,
                 ))),
-                ..WindowOptions::default()
+                ..TitleBar::window_options()
             };
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 let library = cx.new(|_| library::Library::load(&connections));

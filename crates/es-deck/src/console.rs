@@ -13,6 +13,7 @@ use es_client::{Client, Request};
 use es_dsl_core::Index;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
+use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::AlertDialog;
 use gpui_kit::component::input::{
@@ -20,14 +21,11 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::list::{List, ListEvent, ListState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{AppMenuBar, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
-use gpui_kit::component::separator::Separator;
 use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{DataTable, TableState};
-use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, Theme, WindowExt as _,
@@ -35,8 +33,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
-    Styled as _, Task, Window, actions, div, px, rems,
+    InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
+    ParentElement as _, Render, SharedString, Styled as _, Task, Window, actions, div, px, rems,
 };
 
 use crate::completion::{LspCompletion, LspHover};
@@ -60,7 +58,39 @@ const LINT_DELAY: Duration = Duration::from_millis(400);
 /// The response viewer shows at most this much; the status line says when it cut the body.
 const MAX_SHOWN: usize = 2 * 1024 * 1024;
 
-actions!(console, [Send, Format, Newline, Accept]);
+actions!(
+    console,
+    [
+        Send,
+        Format,
+        Newline,
+        Accept,
+        CancelRequest,
+        ToggleTree,
+        ToggleReadonly,
+        ShowHistory,
+        ShowShortcuts
+    ]
+);
+
+/// The application menu: one Action per command, shared with the key bindings. Native on macOS,
+/// drawn by `AppMenuBar` in the title bar elsewhere.
+pub fn app_menus() -> Vec<Menu> {
+    vec![
+        Menu::new("Request").items([
+            MenuItem::action("Send", Send),
+            MenuItem::action("Cancel", CancelRequest),
+            MenuItem::separator(),
+            MenuItem::action("Format body", Format),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle tree", ToggleTree),
+            MenuItem::action("History…", ShowHistory),
+            MenuItem::action("Toggle readonly", ToggleReadonly),
+        ]),
+        Menu::new("Help").items([MenuItem::action("Shortcuts", ShowShortcuts)]),
+    ]
+}
 
 /// Binds Ctrl/Cmd+Enter to [`Send`] and Ctrl/Cmd+Shift+F to [`Format`] inside editors. It must run
 /// after `gpui_kit::init`: a later binding wins over the editor's own Ctrl/Cmd+Enter, which would
@@ -167,6 +197,8 @@ pub struct Console {
     online: bool,
     /// Whether the tree panel is shown.
     sidebar_open: bool,
+    /// Whether the tree's filter input is shown; hidden, it filters nothing.
+    filter_open: bool,
     /// The connected cluster's completion cache, kept for the tree's refresh button.
     meta: Option<es_client::ClusterMeta>,
     /// Dropping it stops refreshing for the previous connection.
@@ -174,6 +206,7 @@ pub struct Console {
     /// A pending check; replaced (so cancelled) by the next edit.
     lint: Option<Task<()>>,
     paint: Paint,
+    menu_bar: Entity<AppMenuBar>,
 }
 
 impl Console {
@@ -226,7 +259,7 @@ impl Console {
                 .language("json")
                 .soft_wrap(false)
         });
-        let targets = cx.new(|cx| ListState::new(Targets::default(), window, cx).searchable(true));
+        let targets = cx.new(|cx| ListState::new(Targets::default(), window, cx));
         cx.subscribe(&targets, |this, list, ev: &ListEvent, cx| {
             if let ListEvent::Confirm(ix) = ev {
                 let picked = list.update(cx, |list, cx| {
@@ -290,10 +323,12 @@ impl Console {
             client,
             online: false,
             sidebar_open: true,
+            filter_open: false,
             meta: None,
             refresh: None,
             lint: None,
             paint,
+            menu_bar: AppMenuBar::new(cx),
         }
     }
 
@@ -803,6 +838,32 @@ impl Console {
         cx.notify();
     }
 
+    fn show_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let list = self.history_list.clone();
+        let console = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let console = console.clone();
+            dialog.title("History").w(px(640.)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().h_80().child(List::new(&list)))
+                    .child(
+                        div().flex().justify_end().child(
+                            Button::new("clear-history")
+                                .ghost()
+                                .small()
+                                .label("Clear history")
+                                .on_click(move |_, _, cx| {
+                                    console.update(cx, |this, cx| this.clear_history(cx))
+                                }),
+                        ),
+                    ),
+            )
+        });
+    }
+
     fn show_help(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, move |dialog, _, _| {
             let line = |keys: String, what: &'static str| {
@@ -924,6 +985,12 @@ impl Console {
     }
 }
 
+/// Title-bar controls must not start a window drag, which would swallow their click.
+fn no_drag(_: &MouseDownEvent, window: &mut Window, cx: &mut App) {
+    window.prevent_default();
+    cx.stop_propagation();
+}
+
 fn install(state: &mut EditorState, client: &Arc<LspClient>) {
     let lsp = state.lsp_mut();
     lsp.completion_provider = Some(Rc::new(LspCompletion(client.clone())));
@@ -943,120 +1010,37 @@ fn restyle(window: Option<&mut Window>, cx: &mut App) {
 }
 
 impl Console {
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self
             .summary
             .as_ref()
             .map_or("Connect…".into(), |s| s.name.clone());
         let muted = cx.theme().muted_foreground;
         let console = cx.entity();
-        let sending = matches!(self.run, Run::Sending);
-        Toolbar::new("console-toolbar")
+        let version = self
+            .summary
+            .as_ref()
+            .map_or(SharedString::default(), |s| s.version.clone());
+        // Flat, in the window ground colour, so the title bar and the islands read as one surface.
+        let ground = cx
+            .theme()
+            .background
+            .blend(cx.theme().foreground.opacity(0.09));
+        TitleBar::new()
+            .bg(ground)
+            .border_0()
+            .child(self.menu_bar.clone())
+            .child(self.render_toolbar(cx))
             .child(
-                Button::new("send")
-                    .small()
-                    .icon(IconName::Play)
-                    .primary()
-                    .disabled(sending)
-                    .tooltip(format!("Send the request at the cursor ({SEND_SHORTCUT})"))
-                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-            )
-            .child(
-                Button::new("cancel")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Square)
-                    .disabled(!sending)
-                    .tooltip("Cancel the request in flight")
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
-            )
-            .content(div().h_4().child(Separator::vertical()))
-            .child(
-                Button::new("toggle-tree")
-                    .ghost()
-                    .small()
-                    .icon(IconName::PanelLeft)
-                    .selected(self.sidebar_open)
-                    .tooltip("Show or hide the tree")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_open = !this.sidebar_open;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("history")
-                    .ghost()
-                    .icon(IconName::Clock)
-                    .small()
-                    .tooltip("History")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let list = this.history_list.clone();
-                        let console = cx.entity();
-                        window.open_dialog(cx, move |dialog, _, _| {
-                            let console = console.clone();
-                            dialog.title("History").w(px(640.)).child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(div().h_80().child(List::new(&list)))
-                                    .child(
-                                        div().flex().justify_end().child(
-                                            Button::new("clear-history")
-                                                .ghost()
-                                                .small()
-                                                .label("Clear history")
-                                                .on_click(move |_, _, cx| {
-                                                    console.update(cx, |this, cx| {
-                                                        this.clear_history(cx)
-                                                    })
-                                                }),
-                                        ),
-                                    ),
-                            )
-                        });
-                    })),
-            )
-            .content(div().h_4().child(Separator::vertical()))
-            .child(
-                Button::new("format")
-                    .ghost()
-                    .icon(IconName::Braces)
-                    .small()
-                    .tooltip(format!("Re-indent the request body ({FORMAT_SHORTCUT})"))
-                    .on_click(cx.listener(|this, _, window, cx| this.format(window, cx))),
-            )
-            .content(
                 div()
                     .flex_1()
                     .flex()
                     .justify_end()
                     .text_sm()
                     .text_color(muted)
-                    .child(
-                        self.summary
-                            .as_ref()
-                            .map_or(SharedString::default(), |s| s.version.clone()),
-                    ),
+                    .child(version),
             )
-            .child(
-                Switch::new("readonly")
-                    .label("Readonly")
-                    .checked(self.readonly)
-                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                        this.readonly = *checked;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("help")
-                    .ghost()
-                    .small()
-                    .icon(IconName::CircleQuestionMark)
-                    .tooltip("Shortcuts")
-                    .on_click(cx.listener(|this, _, window, cx| this.show_help(window, cx))),
-            )
-            .content({
+            .child(div().on_mouse_down(MouseButton::Left, no_drag).child({
                 let (panel, current) = (self.panel.clone(), label.to_string());
                 Button::new("connections")
                     .ghost()
@@ -1087,7 +1071,64 @@ impl Console {
                                 },
                             ))
                     })
-            })
+            }))
+    }
+
+    /// Always-visible commands, in the title bar next to the menus; the same ones are in the menus.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sending = matches!(self.run, Run::Sending);
+        div()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .ml_2()
+            .on_mouse_down(MouseButton::Left, no_drag)
+            .child(
+                Button::new("send")
+                    .small()
+                    .icon(IconName::Play)
+                    .primary()
+                    .disabled(sending)
+                    .tooltip(format!("Send the request at the cursor ({SEND_SHORTCUT})"))
+                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
+            )
+            .child(
+                Button::new("cancel")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Square)
+                    .disabled(!sending)
+                    .tooltip("Cancel the request in flight")
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+            )
+            .child(
+                Button::new("format")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Braces)
+                    .tooltip(format!("Re-indent the request body ({FORMAT_SHORTCUT})"))
+                    .on_click(cx.listener(|this, _, window, cx| this.format(window, cx))),
+            )
+            .child(
+                Button::new("toggle-tree")
+                    .ghost()
+                    .small()
+                    .icon(IconName::PanelLeft)
+                    .selected(self.sidebar_open)
+                    .tooltip("Show or hide the tree")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = !this.sidebar_open;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("history")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Clock)
+                    .tooltip("History")
+                    .on_click(cx.listener(|this, _, window, cx| this.show_history(window, cx))),
+            )
     }
 
     /// Bottom bar: the outcome of the last request on the left, the document check on the right.
@@ -1327,7 +1368,7 @@ impl Render for Console {
         } else {
             theme.danger
         };
-        let (border, radius, surface) = (theme.border, theme.radius_lg, theme.background);
+        let (radius, surface) = (theme.radius_lg, theme.background);
         // Islands: panels float as raised cards on a slightly darker window ground.
         let ground = theme.background.blend(theme.foreground.opacity(0.09));
         let card = move || {
@@ -1337,40 +1378,26 @@ impl Render for Console {
                 .rounded(radius)
                 .bg(surface)
         };
+        // Like an IDEA tool window: a title row, the actions as one quiet icon row under it, then the tree.
         let header = div()
             .flex()
             .items_center()
             .gap_2()
-            .px_1()
-            .child(div().size_2().flex_none().rounded_full().bg(dot))
+            .px_2()
+            .pt_1()
             .child(
                 div()
                     .flex_1()
                     .truncate()
-                    .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(SharedString::from(self.connection_name())),
             )
-            .child(
-                tool("tree-refresh", IconName::RefreshCw, "Reload the tree").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        if let Some(meta) = &meta {
-                            this.refresh_tree(meta, cx);
-                        }
-                    },
-                )),
-            )
-            .child(
-                tool("disconnect", IconName::Unplug, "Disconnect")
-                    .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
-            );
-        let footer = div()
+            .child(div().size_1p5().flex_none().rounded_full().bg(dot));
+        let actions = div()
             .flex()
             .items_center()
-            .gap_1()
-            .pt_1()
-            .border_t_1()
-            .border_color(border)
+            .gap_0p5()
+            .px_1()
             .child(
                 tool(
                     "save-console",
@@ -1379,7 +1406,6 @@ impl Render for Console {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.save_console(cx))),
             )
-            .child(div().flex_1())
             .child(
                 tool(
                     "rename-saved",
@@ -1395,21 +1421,53 @@ impl Render for Console {
                     "Delete the selected saved item",
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.delete_saved(cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                tool("tree-filter", IconName::Search, "Filter the tree")
+                    .selected(self.filter_open)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.filter_open = !this.filter_open;
+                        let open = this.filter_open;
+                        this.targets.update(cx, |list, cx| {
+                            if !open {
+                                list.set_query("", window, cx);
+                            }
+                            list.set_searchable(open, cx);
+                            if open {
+                                list.focus(window, cx);
+                            }
+                        });
+                        cx.notify();
+                    })),
+            )
+            .child(
+                tool("tree-refresh", IconName::RefreshCw, "Reload the tree").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if let Some(meta) = &meta {
+                            this.refresh_tree(meta, cx);
+                        }
+                    },
+                )),
+            )
+            .child(
+                tool("disconnect", IconName::Unplug, "Disconnect")
+                    .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
             );
         let targets = card()
             .bg(surface)
-            .p_2()
+            .p_1p5()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(header)
+            .child(actions)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .child(List::new(&self.targets).search_placeholder("Filter")),
-            )
-            .child(footer);
+            );
         div()
             .size_full()
             .flex()
@@ -1419,15 +1477,22 @@ impl Render for Console {
             .on_action(cx.listener(|this, _: &Format, window, cx| this.format(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| this.newline(window, cx)))
             .on_action(cx.listener(|this, _: &Accept, window, cx| this.accept(window, cx)))
-            .child(
-                div().p_2().child(
-                    div()
-                        .overflow_hidden()
-                        .rounded(radius)
-                        .bg(surface)
-                        .child(self.render_toolbar(cx)),
-                ),
+            .on_action(cx.listener(|this, _: &CancelRequest, _, cx| this.cancel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleTree, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleReadonly, _, cx| {
+                this.readonly = !this.readonly;
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &ShowHistory, window, cx| this.show_history(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &ShowShortcuts, window, cx| this.show_help(window, cx)),
+            )
+            .child(self.render_titlebar(cx))
             .child(
                 // Panels clip their content and the editors do not wrap, so a narrower panel
                 // hides text instead of reflowing it.
