@@ -3,9 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IndexPath, Sizable as _};
-use gpui_kit::{
-    App, Context, FontWeight, ParentElement as _, SharedString, Styled as _, Task, Window, div,
-};
+use gpui_kit::{App, Context, ParentElement as _, SharedString, Styled as _, Task, Window, div};
 
 use crate::connect::row_id;
 
@@ -54,12 +52,23 @@ impl Folder {
         }
     }
 
+    /// The icon of a row in this folder.
     fn icon(self) -> IconName {
         match self {
-            Self::Indices => IconName::Database,
+            Self::Consoles => IconName::SquareTerminal,
+            Self::Requests => IconName::Braces,
+            Self::Indices => IconName::Table2,
             Self::Aliases => IconName::Link2,
-            _ => IconName::FileText,
+            Self::Nodes => IconName::Server,
+            Self::Tasks => IconName::Clock,
+            Self::Pipelines => IconName::ListTree,
+            Self::Queries | Self::Templates => IconName::FileText,
         }
+    }
+
+    /// The user's own buckets stay listed while empty, so it is visible where saved items go.
+    fn always_shown(self) -> bool {
+        matches!(self, Self::Consoles | Self::Requests | Self::Queries)
     }
 }
 
@@ -162,10 +171,10 @@ impl Targets {
 
     fn relayout(&mut self) {
         self.lines.clear();
-        for slot in 0..FOLDERS.len() {
+        for (slot, folder) in FOLDERS.iter().enumerate() {
             let rows = self.shown[slot].len();
-            // An empty folder is noise; the tree only lists what exists.
-            if rows == 0 {
+            // Other empty folders are noise; the tree only lists what exists. A filter hides all of them.
+            if rows == 0 && !(folder.always_shown() && self.query.trim().is_empty()) {
                 continue;
             }
             self.lines.push(Line::Folder(slot));
@@ -219,28 +228,39 @@ impl ListDelegate for Targets {
         let row = div().flex().items_center().gap_1p5().min_w_0();
         Some(match line {
             Line::Folder(slot) => {
-                let chevron = if self.is_open(slot) {
-                    IconName::ChevronDown
+                let open = self.is_open(slot);
+                let empty = self.shown[slot].is_empty();
+                let icon = if open && !empty {
+                    IconName::FolderOpen
                 } else {
-                    IconName::ChevronRight
+                    IconName::Folder
                 };
+                // An empty folder keeps the chevron's width so titles line up.
+                let chevron = div().size_4().flex_none().children((!empty).then(|| {
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .small()
+                    .text_color(muted)
+                }));
                 ListItem::new(("tree-folder", slot)).child(
-                    row.child(Icon::new(chevron).small().text_color(muted))
+                    row.child(chevron)
+                        .child(Icon::new(icon).small().text_color(muted))
                         .child(
                             div()
                                 .flex_1()
                                 .truncate()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(muted)
+                                .text_sm()
                                 .child(FOLDERS[slot].title()),
                         )
-                        .child(
+                        .children((!empty).then(|| {
                             div()
                                 .text_xs()
                                 .text_color(muted)
-                                .child(self.shown[slot].len().to_string()),
-                        ),
+                                .child(self.shown[slot].len().to_string())
+                        })),
                 )
             }
             Line::Item(slot, i) => {
@@ -249,8 +269,8 @@ impl ListDelegate for Targets {
                 ListItem::new(("tree-item", id))
                     .selected(self.selected == Some(ix))
                     .child(
-                        // Indented under the folder, past its chevron.
-                        row.pl_5()
+                        // Indented under the folder's icon, past its chevron.
+                        row.pl_9()
                             .child(Icon::new(FOLDERS[slot].icon()).small().text_color(muted))
                             .child(div().truncate().child(SharedString::from(label))),
                     )
@@ -295,16 +315,18 @@ mod tests {
     #[test]
     fn only_folders_with_rows_show_and_only_the_indices_start_open() {
         let mut t = Targets::default();
-        assert!(t.lines.is_empty());
+        // Only the user's own buckets are listed while empty.
+        assert_eq!(t.lines, [Line::Folder(0), Line::Folder(1), Line::Folder(2)]);
         assert!(t.set(Folder::Indices, vec![row("a"), row("b")]));
         assert!(!t.set(Folder::Indices, vec![row("a"), row("b")]));
         assert!(t.set(Folder::Nodes, vec![row("n1")]));
-        // Indices open with two rows, nodes closed.
-        assert_eq!(t.lines.len(), 4);
-        assert_eq!(t.activate(at(3)), None, "a folder line toggles");
-        assert_eq!(t.lines.len(), 3);
-        assert_eq!(t.activate(at(3)), None);
-        assert_eq!(t.activate(at(1)), Some((Folder::Indices, "GET a".into())));
+        // Three buckets, indices open with two rows, nodes closed.
+        assert_eq!(t.lines.len(), 7);
+        assert_eq!(t.activate(at(6)), None, "a folder line toggles");
+        assert_eq!(t.lines.len(), 8, "nodes opened");
+        assert_eq!(t.activate(at(6)), None);
+        assert_eq!(t.lines.len(), 7, "nodes closed again");
+        assert_eq!(t.activate(at(4)), Some((Folder::Indices, "GET a".into())));
     }
 
     #[test]
@@ -316,6 +338,14 @@ mod tests {
         assert_eq!(t.lines, [Line::Folder(5), Line::Item(5, 0)]);
         t.query.clear();
         t.refilter();
-        assert_eq!(t.lines, [Line::Folder(5)]);
+        assert_eq!(
+            t.lines,
+            [
+                Line::Folder(0),
+                Line::Folder(1),
+                Line::Folder(2),
+                Line::Folder(5)
+            ]
+        );
     }
 }

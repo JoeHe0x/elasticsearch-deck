@@ -17,6 +17,7 @@ icon_assets!(
         Download,
         FileText,
         Folder,
+        FolderOpen,
         Link2,
         ListTree,
         PanelLeft,
@@ -24,6 +25,8 @@ icon_assets!(
         Plus,
         RefreshCw,
         Save,
+        Server,
+        SquareTerminal,
         Table2,
         Trash,
         Unplug
