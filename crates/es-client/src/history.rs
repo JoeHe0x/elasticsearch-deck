@@ -44,21 +44,15 @@ pub fn record(entries: &mut Vec<Entry>, entry: Entry) -> bool {
     true
 }
 
-/// A missing file is an empty list. Also used for the saved-item file.
+/// A missing file is an empty list; an unreadable one is moved aside and reported (see `store::read_json`).
+/// Also used for the saved-item file.
 pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| Error::Config(e.to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(Error::Config(e.to_string())),
-    }
+    Ok(crate::store::read_json(path)?.unwrap_or_default())
 }
 
 pub fn save<T: Serialize>(path: &Path, entries: &[T]) -> Result<()> {
     let text = serde_json::to_string(entries).map_err(|e| Error::Config(e.to_string()))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::Config(e.to_string()))?;
-    }
-    std::fs::write(path, text).map_err(|e| Error::Config(e.to_string()))
+    crate::store::write_atomic(path, &text)
 }
 
 #[cfg(test)]

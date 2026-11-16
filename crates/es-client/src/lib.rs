@@ -10,6 +10,7 @@ mod hits;
 mod json_tree;
 mod meta;
 pub mod saved;
+mod store;
 pub use connection::{AuthKind, Connection, Keychain, Secrets};
 
 pub use hits::{Hits, parse_hits};

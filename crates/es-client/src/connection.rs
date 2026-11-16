@@ -68,13 +68,9 @@ impl Connection {
     }
 }
 
-/// Reads the saved connections; a missing file is an empty list.
+/// Reads the saved connections; a missing file is an empty list, an unreadable one is moved aside and reported.
 pub fn load(path: &Path) -> Result<Vec<Connection>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| Error::Config(e.to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(Error::Config(e.to_string())),
-    }
+    Ok(crate::store::read_json(path)?.unwrap_or_default())
 }
 
 /// Replaces the saved list. Names must be unique, since they key the keychain entries.
@@ -87,10 +83,7 @@ pub fn save(path: &Path, conns: &[Connection]) -> Result<()> {
         ));
     }
     let text = serde_json::to_string_pretty(conns).map_err(|e| Error::Config(e.to_string()))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::Config(e.to_string()))?;
-    }
-    std::fs::write(path, text).map_err(|e| Error::Config(e.to_string()))
+    crate::store::write_atomic(path, &text)
 }
 
 /// Where secrets are kept; [`Keychain`] is the real one.
