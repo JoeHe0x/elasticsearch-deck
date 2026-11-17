@@ -1803,6 +1803,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
+ "embed-resource",
  "es-client",
  "es-dsl-core",
  "es-dsl-lsp",
