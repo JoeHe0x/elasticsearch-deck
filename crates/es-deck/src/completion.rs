@@ -31,6 +31,10 @@ pub fn highlight_subsequence(query: &str, item: &CompletionItem) -> Vec<Range<us
     }
 }
 
+fn is_trigger_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '.' | '"')
+}
+
 pub struct LspCompletion(pub Arc<LspClient>);
 
 impl CompletionProvider for LspCompletion {
@@ -51,9 +55,11 @@ impl CompletionProvider for LspCompletion {
         )
     }
 
-    // The server decides what is completable; asking on every edit keeps the provider free of JSON rules.
-    fn is_completion_trigger(&self, _offset: usize, _new_text: &str, _cx: &mut App) -> bool {
-        true
+    // The server decides what is completable, so the only rule here is when to ask: after identifier
+    // characters and an opening quote, never after structure (`{ [ , :`) or whitespace, where an
+    // auto-opened menu would swallow Enter.
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
+        new_text.chars().any(is_trigger_char)
     }
 }
 
@@ -77,6 +83,16 @@ impl HoverProvider for LspHover {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structure_and_whitespace_do_not_trigger() {
+        for t in ["{", "[", ",", ":", " ", "\n", ""] {
+            assert!(!t.chars().any(is_trigger_char), "{t:?}");
+        }
+        for t in ["q", "_", ".", "\"", "9"] {
+            assert!(t.chars().any(is_trigger_char), "{t:?}");
+        }
+    }
 
     fn marked(query: &str, label: &str) -> Vec<usize> {
         let item = CompletionItem {

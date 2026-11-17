@@ -16,9 +16,7 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::AlertDialog;
-use gpui_kit::component::input::{
-    Editor, EditorState, Enter, Escape, Input, InputEvent, InputState,
-};
+use gpui_kit::component::input::{Editor, EditorState, Enter, Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::menu::{AppMenuBar, DropdownMenu as _, PopupMenuItem};
@@ -64,7 +62,6 @@ actions!(
         Send,
         Format,
         Newline,
-        Accept,
         CancelRequest,
         ToggleTree,
         ToggleReadonly,
@@ -100,7 +97,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(SEND_KEY, Send, Some("Input")),
         KeyBinding::new(FORMAT_KEY, Format, Some("Input")),
         KeyBinding::new("enter", Newline, Some("Input")),
-        KeyBinding::new("space", Accept, Some("Input")),
     ]);
 }
 
@@ -333,7 +329,7 @@ impl Console {
     }
 
     /// The open completion menu of the focused editor, if any. Other inputs under the console (the
-    /// tree filter, dialogs) keep their own Enter and Space, so callers propagate when this is `None`.
+    /// tree filter, dialogs) keep their own Enter, so callers propagate when this is `None`.
     fn open_menu(&self, window: &Window, cx: &App) -> Option<bool> {
         let editor = self.editor.read(cx);
         editor
@@ -342,18 +338,8 @@ impl Console {
             .then(|| editor.completion_menu_state().open)
     }
 
-    /// Enter is a plain newline: an open menu is dismissed first, never accepted.
+    /// Enter takes the highlighted suggestion; with no menu open it is a plain newline.
     fn newline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open_menu(window, cx) == Some(true) {
-            self.editor.update(cx, |state, cx| {
-                state.route_overlay_action(Box::new(Escape), window, cx);
-            });
-        }
-        cx.propagate();
-    }
-
-    /// Space takes the highlighted suggestion; with no menu open it types a space as usual.
-    fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_menu(window, cx) == Some(true) {
             let enter = Enter {
                 secondary: false,
@@ -1476,7 +1462,6 @@ impl Render for Console {
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Format, window, cx| this.format(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| this.newline(window, cx)))
-            .on_action(cx.listener(|this, _: &Accept, window, cx| this.accept(window, cx)))
             .on_action(cx.listener(|this, _: &CancelRequest, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &ToggleTree, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
