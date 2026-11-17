@@ -41,6 +41,15 @@ pub struct Connection {
     pub timeout_secs: u64,
 }
 
+/// The token without a pasted `Bearer ` prefix, so both forms work; the header adds it back.
+fn bare_token(token: &str) -> &str {
+    let token = token.trim();
+    match token.get(..7) {
+        Some(p) if p.eq_ignore_ascii_case("bearer ") => token[7..].trim_start(),
+        _ => token,
+    }
+}
+
 impl Connection {
     /// Builds a client config; `secret` is the password, API key or bearer token, as the auth kind requires.
     pub fn config(&self, secret: Option<String>) -> Result<Config> {
@@ -52,7 +61,7 @@ impl Connection {
                 password,
             },
             (AuthKind::ApiKey, Some(key)) => Auth::ApiKey(key),
-            (AuthKind::Bearer, Some(token)) => Auth::Bearer(token),
+            (AuthKind::Bearer, Some(token)) => Auth::Bearer(bare_token(&token).into()),
             (_, None) => return Err(Error::Config("the connection needs a secret".into())),
         };
         if !self.ca_file.is_empty() {
@@ -165,6 +174,12 @@ mod tests {
             bearer.config(Some("t".into())).unwrap().auth,
             Auth::Bearer(_)
         ));
+        for pasted in ["t", " t ", "Bearer t", "bearer  t"] {
+            assert!(matches!(
+                bearer.config(Some(pasted.into())).unwrap().auth,
+                Auth::Bearer(ref t) if t == "t"
+            ));
+        }
         let open = Connection {
             auth: AuthKind::None,
             ..c
