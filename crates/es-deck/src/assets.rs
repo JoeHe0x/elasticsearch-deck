@@ -23,6 +23,8 @@ icon_assets!(
         FolderOpen,
         Link2,
         ListTree,
+        Lock,
+        LockOpen,
         PanelLeft,
         Pencil,
         Plus,

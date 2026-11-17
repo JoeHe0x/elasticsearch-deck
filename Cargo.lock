@@ -1811,6 +1811,7 @@ dependencies = [
  "gpui-kit",
  "lsp-server",
  "lsp-types",
+ "serde",
  "serde_json",
 ]
 

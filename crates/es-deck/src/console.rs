@@ -23,24 +23,24 @@ use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::menu::{
     AppMenuBar, ContextMenuExt as _, DropdownMenu as _, PopupMenuItem,
 };
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, Theme, WindowExt as _,
-    scroll::ScrollbarMode,
+    ActiveTheme as _, Disableable as _, GlobalState, Selectable as _, Sizable as _, WindowExt as _,
 };
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
-    Window, actions, div, px, rems,
+    ParentElement as _, Render, Role, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Task, TestSupportExt as _, Window, actions, div, rems,
 };
 
+use crate::appearance::{self, Pref};
 use crate::completion::{LspCompletion, LspHover};
-use crate::connect::{ConnectPanel, Connected};
+use crate::connect::{ConnectPanel, Connected, row_id};
 use crate::history_list::HistoryList;
 use crate::hits_table::HitsTable;
 use crate::library::{Changed, Library};
@@ -71,13 +71,20 @@ actions!(
         ToggleTree,
         ToggleReadonly,
         ShowHistory,
-        ShowShortcuts
+        ShowShortcuts,
+        NextTab,
+        PreviousTab,
+        CloseTab,
+        UseSystemAppearance,
+        UseLightAppearance,
+        UseDarkAppearance
     ]
 );
 
 /// The application menu: one Action per command, shared with the key bindings. Native on macOS,
-/// drawn by `AppMenuBar` in the title bar elsewhere.
-pub fn app_menus() -> Vec<Menu> {
+/// drawn by `AppMenuBar` in the title bar elsewhere. The two toggles carry a check mark so the
+/// menu itself says which state is on.
+pub fn app_menus(pref: Pref, readonly: bool) -> Vec<Menu> {
     vec![
         Menu::new("Request").items([
             MenuItem::action("Send", Send),
@@ -88,10 +95,31 @@ pub fn app_menus() -> Vec<Menu> {
         Menu::new("View").items([
             MenuItem::action("Toggle tree", ToggleTree),
             MenuItem::action("History…", ShowHistory),
-            MenuItem::action("Toggle readonly", ToggleReadonly),
+            MenuItem::action("Readonly", ToggleReadonly).checked(readonly),
+            MenuItem::separator(),
+            MenuItem::action("Follow system appearance", UseSystemAppearance)
+                .checked(pref == Pref::System),
+            MenuItem::action("Light appearance", UseLightAppearance).checked(pref == Pref::Light),
+            MenuItem::action("Dark appearance", UseDarkAppearance).checked(pref == Pref::Dark),
+            MenuItem::separator(),
+            MenuItem::action("Next tab", NextTab),
+            MenuItem::action("Previous tab", PreviousTab),
+            MenuItem::action("Close tab", CloseTab),
         ]),
         Menu::new("Help").items([MenuItem::action("Shortcuts", ShowShortcuts)]),
     ]
+}
+
+/// Installs the menus in both places they appear: the platform menu bar and the `AppMenuBar` the
+/// title bar draws off macOS. Every toggle that carries a check mark rebuilds them.
+pub fn set_menus(cx: &mut App, pref: Pref, readonly: bool) {
+    cx.set_menus(app_menus(pref, readonly));
+    GlobalState::global_mut(cx).set_app_menus(
+        app_menus(pref, readonly)
+            .into_iter()
+            .map(|m| m.owned())
+            .collect(),
+    );
 }
 
 /// Binds Ctrl/Cmd+Enter to [`Send`] and Ctrl/Cmd+Shift+F to [`Format`] inside editors. It must run
@@ -102,6 +130,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(SEND_KEY, Send, Some("Input")),
         KeyBinding::new(FORMAT_KEY, Format, Some("Input")),
         KeyBinding::new("enter", Newline, Some("Input")),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+        KeyBinding::new(CLOSE_TAB_KEY, CloseTab, None),
     ]);
 }
 
@@ -114,6 +145,11 @@ const SEND_KEY: &str = "ctrl-enter";
 const FORMAT_KEY: &str = "cmd-shift-f";
 #[cfg(not(target_os = "macos"))]
 const FORMAT_KEY: &str = "ctrl-shift-f";
+
+#[cfg(target_os = "macos")]
+const CLOSE_TAB_KEY: &str = "cmd-w";
+#[cfg(not(target_os = "macos"))]
+const CLOSE_TAB_KEY: &str = "ctrl-w";
 
 /// How a search response is shown; other responses are always JSON.
 #[derive(Clone, Copy, PartialEq)]
@@ -194,6 +230,10 @@ pub struct Console {
     view: View,
     /// Blocks every request that would change the cluster; per session, off at start.
     readonly: bool,
+    /// The appearance the user chose; only `System` lets later OS changes through.
+    theme: Pref,
+    /// Where the choice is remembered, next to the other config files.
+    appearance_file: PathBuf,
     /// Diagnostics in the editor text as of the last check; `None` before the first one.
     problems: Option<usize>,
     /// JSON path at the cursor, as shown in the status bar; empty outside a body.
@@ -321,10 +361,17 @@ impl Console {
             }
         })
         .detach();
-        // The kit does not follow the system appearance by itself: apply it now and on every change.
-        restyle(Some(window), cx);
-        cx.observe_window_appearance(window, |_, window, cx| restyle(Some(window), cx))
-            .detach();
+        // The kit does not follow the system appearance by itself: apply the remembered choice now
+        // and, while it is `System`, on every change.
+        let appearance_file = connections.with_file_name("appearance.json");
+        let theme = Pref::load(&appearance_file);
+        appearance::apply(theme, Some(window), cx);
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if this.theme == Pref::System {
+                appearance::apply(this.theme, Some(window), cx);
+            }
+        })
+        .detach();
         cx.subscribe(&library, |this, _, ev: &Changed, cx| match ev {
             Changed::Saved => this.refresh_saved(cx),
             Changed::History => this.refresh_history(cx),
@@ -365,6 +412,8 @@ impl Console {
             history_list,
             view: View::Table,
             readonly: false,
+            theme,
+            appearance_file,
             problems: None,
             crumbs: SharedString::default(),
             active_block: None,
@@ -742,6 +791,11 @@ impl Console {
         let Some(name) = self.tabs.get(ix).cloned() else {
             return;
         };
+        // Consoles are stored per connection; with none there is no text to load, and reloading
+        // would clear the draft still in the editor.
+        if self.summary.is_none() {
+            return;
+        }
         let text = self
             .library
             .read(cx)
@@ -765,7 +819,75 @@ impl Console {
         }
     }
 
-    /// One rounded tab per console: icon, name and a quiet close mark, the active one framed in blue.
+    /// Closes the tab called `name`; the lookup keeps a button press from depending on an index
+    /// that moved since the frame was drawn.
+    fn close_named_tab(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| t == name) {
+            self.close_tab(ix, cx);
+        }
+    }
+
+    /// Moves the selection `step` tabs forward or back, wrapping around the ends.
+    fn cycle_tab(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let Some(ix) = self.tabs.iter().position(|t| *t == self.active) else {
+            return;
+        };
+        let next = (ix as isize + step).rem_euclid(self.tabs.len() as isize) as usize;
+        self.select_tab(next, cx);
+    }
+
+    /// Closes the active tab, if another one remains.
+    fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| *t == self.active) {
+            self.close_tab(ix, cx);
+        }
+    }
+
+    /// The menu item, the toolbar button and the action all land here, so the mode has a single
+    /// way to change and every surface redraws together.
+    fn toggle_readonly(&mut self, cx: &mut Context<Self>) {
+        self.readonly = !self.readonly;
+        // The menu item carries a check mark for the mode, so it has to be rebuilt with it.
+        self.refresh_menus(cx);
+        cx.notify();
+    }
+
+    /// Rebuilds both menu bars after anything they show as a check mark changes.
+    fn refresh_menus(&self, cx: &mut Context<Self>) {
+        set_menus(cx, self.theme, self.readonly);
+        self.menu_bar.update(cx, |bar, cx| bar.reload(cx));
+    }
+
+    /// Applies and remembers the appearance. Both menus are rebuilt because they are where the
+    /// current choice is shown, and a native menu keeps the check marks it was built with.
+    fn set_theme(&mut self, pref: Pref, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme == pref {
+            return;
+        }
+        self.theme = pref;
+        appearance::apply(pref, Some(window), cx);
+        self.refresh_menus(cx);
+        let path = self.appearance_file.clone();
+        cx.background_spawn(async move { pref.save(&path) })
+            .detach();
+        cx.notify();
+    }
+
+    /// Replaces the draft with `text` and focuses the editor, so the next keystroke or `Send`
+    /// acts on the example the user picked.
+    fn fill_editor(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.set_selected_range(text.len()..text.len(), cx);
+            state.focus(window, cx);
+        });
+    }
+
+    /// One tab per console: icon, name and a close button. Right-click renames or deletes a saved
+    /// console; the active one is tinted, so the strip reads at a glance.
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let conn = self.connection_name();
         let closable = self.tabs.len() > 1;
@@ -785,7 +907,7 @@ impl Console {
                     format!("{name} [{conn}]")
                 };
                 let tab = div()
-                    .id(("console-tab", ix))
+                    .id(("console-tab", row_id(name)))
                     .flex_none()
                     .h(rems(1.75))
                     .px_2()
@@ -811,9 +933,11 @@ impl Console {
                 };
                 let (rename, delete) = (console.clone(), console.clone());
                 let (rename_name, delete_name) = (name.clone(), name.clone());
+                let target = name.clone();
                 let tab = tab.children(closable.then(|| {
                     div()
-                        .id(("close-tab", ix))
+                        .id(("close-tab", row_id(name)))
+                        .test_support()
                         .size_4()
                         .flex()
                         .items_center()
@@ -823,7 +947,7 @@ impl Console {
                         .hover(|s| s.bg(muted.opacity(0.2)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.close_tab(ix, cx);
+                            this.close_named_tab(&target, cx);
                         }))
                         .child(Icon::new(IconName::Close).size_3())
                 }));
@@ -1080,17 +1204,30 @@ impl Console {
         if let Some(copy) = start {
             panel.update(cx, |p, cx| p.start_new(copy, window, cx));
         }
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, _| {
             // The list (12rem) plus the form need more than the default 448px, or the two squeeze together.
-            dialog.title("Connections").w(px(720.)).child(panel.clone())
+            dialog
+                .title("Connections")
+                .w(rems(45.).to_pixels(window.rem_size()))
+                .child(panel.clone())
         });
     }
 
     /// Drops the connection: stops refreshing and cancels whatever is in flight.
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        // Keep the text with the connection it was typed in while that name still exists.
+        self.save_active(cx);
         (self.http, self.summary, self.meta) = (None, None, None);
         (self.refresh, self.catalog, self.sending) = (None, None, None);
         (self.online, self.run) = (false, Run::Idle);
+        // Tabs, panes and the response belong to the connection. Without one only the default tab
+        // remains, so a click cannot load an empty console over the draft; the old response must
+        // not linger either.
+        self.tabs = vec![saved::AUTO_CONSOLE.into()];
+        self.active = saved::AUTO_CONSOLE.into();
+        self.panes.clear();
+        (self.hits, self.tree, self.full_body) = (None, None, None);
+        self.view = View::Json;
         self.targets.update(cx, |list, cx| {
             list.delegate_mut().clear();
             cx.notify();
@@ -1102,26 +1239,29 @@ impl Console {
     fn show_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let list = self.history_list.clone();
         let console = cx.entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, _| {
             let console = console.clone();
-            dialog.title("History").w(px(640.)).child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(div().h_80().child(List::new(&list)))
-                    .child(
-                        div().flex().justify_end().child(
-                            Button::new("clear-history")
-                                .ghost()
-                                .small()
-                                .label("Clear history")
-                                .on_click(move |_, _, cx| {
-                                    console.update(cx, |this, cx| this.clear_history(cx))
-                                }),
+            dialog
+                .title("History")
+                .w(rems(40.).to_pixels(window.rem_size()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().h_80().child(List::new(&list)))
+                        .child(
+                            div().flex().justify_end().child(
+                                Button::new("clear-history")
+                                    .ghost()
+                                    .small()
+                                    .label("Clear history")
+                                    .on_click(move |_, _, cx| {
+                                        console.update(cx, |this, cx| this.clear_history(cx))
+                                    }),
+                            ),
                         ),
-                    ),
-            )
+                )
         });
     }
 
@@ -1197,30 +1337,59 @@ impl Console {
         self.lint(cx);
     }
 
-    /// Restarts completion against the cluster that just answered, and keeps its metadata fresh.
-    fn connected(&mut self, done: &Connected, cx: &mut Context<Self>) {
-        let started = LspClient::start(self.index.clone(), Some(done.version), done.meta.clone());
-        let Ok(client) = started else { return };
+    /// Takes on `done`'s identity and returns the text its default console should show. `None`
+    /// means this is a reconnect to the same cluster, so the open tabs stay.
+    ///
+    /// Tabs, panes and the response area belong to the connection that produced them: a tab of
+    /// the previous connection would resolve its console against `done.name` and open empty.
+    fn switch_to(&mut self, done: &Connected, cx: &mut Context<Self>) -> Option<String> {
+        // The editor text belongs to the connection being left. Save it before the summary names
+        // the new connection, or a pending autosave would store it under `done.name`.
+        self.save_active(cx);
+        let previous = self.summary.as_ref().map(|s| s.name.to_string());
         let [a, b, c] = done.version;
         self.summary = Some(Summary {
             name: done.name.clone().into(),
             version: format!("Elasticsearch {a}.{b}.{c}").into(),
         });
+        if previous.as_deref() == Some(done.name.as_str()) {
+            return None;
+        }
+        self.tabs = vec![saved::AUTO_CONSOLE.into()];
+        self.panes.clear();
+        // Empty until `open_console` names the tab, so it does not save the old text under the
+        // new connection.
+        self.active.clear();
+        // The connection's own console comes back; a connection without one keeps the editor text.
+        Some(
+            match self
+                .library
+                .read(cx)
+                .console(&done.name, saved::AUTO_CONSOLE)
+            {
+                Some(text) => text,
+                None => self.editor.read(cx).value().to_string(),
+            },
+        )
+    }
+
+    /// Restarts completion against the cluster that just answered, and keeps its metadata fresh.
+    fn connected(&mut self, done: &Connected, cx: &mut Context<Self>) {
+        let started = LspClient::start(self.index.clone(), Some(done.version), done.meta.clone());
+        let Ok(client) = started else { return };
+        let text = self.switch_to(done, cx);
         self.client = client.clone();
         self.http = Some(done.client.clone());
         self.online = true;
-        self.panes.clear();
         self.refresh_history(cx);
         self.refresh_saved(cx);
         self.load_catalog(cx);
-        // The connection's own console comes back; a connection without one keeps the editor text.
-        let console = self
-            .library
-            .read(cx)
-            .console(&done.name, saved::AUTO_CONSOLE);
-        match console {
-            Some(text) => self.open_console(saved::AUTO_CONSOLE.into(), text, cx),
-            None => self.active = saved::AUTO_CONSOLE.into(),
+        if let Some(text) = text {
+            self.open_console(saved::AUTO_CONSOLE.into(), text, cx);
+        }
+        // `open_console` needs a window; without one the default console is still the one to save.
+        if self.active.is_empty() {
+            self.active = saved::AUTO_CONSOLE.into();
         }
         self.editor.update(cx, |state, _| install(state, &client));
         self.lint(cx);
@@ -1292,17 +1461,6 @@ fn install(state: &mut EditorState, client: &Arc<LspClient>) {
     lsp.completion_provider = Some(Rc::new(LspCompletion(client.clone())));
     lsp.hover_provider = Some(Rc::new(LspHover(client.clone())));
     lsp.set_completion_highlighter(Rc::new(crate::completion::highlight_subsequence));
-}
-
-/// Follows the system appearance, then rounds the theme: a theme load resets the radii.
-fn restyle(window: Option<&mut Window>, cx: &mut App) {
-    Theme::sync_system_appearance(window, cx);
-    // The sync picks hover-only scrollbars off macOS; a table or a long request should show that there is more.
-    Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
-    Theme::update(cx, |theme| {
-        theme.radius = px(8.0);
-        theme.radius_lg = px(12.0);
-    });
 }
 
 impl Console {
@@ -1433,6 +1591,29 @@ impl Console {
                     .tooltip("History")
                     .on_click(cx.listener(|this, _, window, cx| this.show_history(window, cx))),
             )
+            .child({
+                // One of the icon commands: the lock changes shape with the mode and is pressed
+                // while the mode is on, and the status bar repeats the state next to the response.
+                let (icon, tip) = if self.readonly {
+                    (
+                        IconName::Lock,
+                        "Readonly is on: requests that change the cluster are blocked",
+                    )
+                } else {
+                    (
+                        IconName::LockOpen,
+                        "Readonly is off: requests can change the cluster",
+                    )
+                };
+                Button::new("readonly")
+                    .ghost()
+                    .small()
+                    .icon(icon)
+                    .selected(self.readonly)
+                    .accessibility_label(tip)
+                    .tooltip(tip)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_readonly(cx)))
+            })
     }
 
     /// Bottom bar: the outcome of the last request on the left, the document check on the right.
@@ -1477,6 +1658,31 @@ impl Console {
             colored(if n == 0 { muted } else { warning }, text.into())
         });
         let mut bar = StatusBar::new();
+        // The toolbar button shows the mode too, but the status bar sits next to the response it
+        // protects: a write refused silently there would otherwise look like a bug.
+        if self.readonly {
+            bar = bar.left(
+                div()
+                    .id("readonly-badge")
+                    .test_support()
+                    .role(Role::Status)
+                    .aria_label("Readonly is on")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    // A tinted chip, not just colored text: the mode has to stand out from the
+                    // status text next to it at a glance.
+                    .rounded(theme.radius)
+                    .bg(warning.opacity(0.14))
+                    .border_1()
+                    .border_color(warning.opacity(0.35))
+                    .px_1p5()
+                    .text_color(warning)
+                    .child(Icon::new(IconName::Lock).small().text_color(warning))
+                    .child("Readonly"),
+            );
+        }
         if !self.crumbs.is_empty() {
             bar = bar.left(colored(muted, self.crumbs.clone()));
         }
@@ -1487,6 +1693,93 @@ impl Console {
             bar = bar.right(problems);
         }
         bar
+    }
+
+    /// Before the first response: a short hint and requests that show the shape without docs. A
+    /// click fills the editor, so the examples also work before a connection exists; they are only
+    /// offered while the editor is empty, so a typed draft is never replaced.
+    fn render_empty_response(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, foreground, radius, mono) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.radius,
+            theme.mono_font_family.clone(),
+        );
+        let blank = self.editor.read(cx).value().trim().is_empty();
+        let (title, hint) = match (self.http.is_some(), blank) {
+            (true, true) => (
+                "Nothing run yet",
+                format!("Write a request and press {SEND_SHORTCUT} to run it."),
+            ),
+            (true, false) => (
+                "Nothing run yet",
+                format!("Press {SEND_SHORTCUT} to run the request at the cursor."),
+            ),
+            (false, true) => (
+                "No connection",
+                "Open a connection in the title bar, or start from an example.".to_string(),
+            ),
+            (false, false) => (
+                "No connection",
+                "Open a connection in the title bar to run this request.".to_string(),
+            ),
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Icon::new(IconName::SquareTerminal)
+                    .large()
+                    .text_color(muted),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(div().text_sm().text_color(muted).child(hint))
+            .children(blank.then(|| {
+                div()
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(SAMPLES.iter().enumerate().map(|(ix, (name, text))| {
+                        let (name, text) = (*name, *text);
+                        let head = text.lines().next().unwrap_or_default();
+                        div()
+                            .id(("sample-request", ix))
+                            .test_support()
+                            .role(Role::Button)
+                            .aria_label(format!("Insert {text}"))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_2()
+                            .py_1()
+                            .rounded(radius)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(foreground.opacity(0.06)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.fill_editor(text, window, cx)
+                            }))
+                            .child(Icon::new(IconName::Play).xsmall().text_color(muted))
+                            .child(div().text_sm().child(name))
+                            .child(
+                                div()
+                                    .font_family(mono.clone())
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(head.to_string()),
+                            )
+                    }))
+            }))
     }
 
     /// The response viewer: view tabs and actions above the body. Only built once a response exists.
@@ -1523,11 +1816,10 @@ impl Console {
                     cx.notify();
                 }
             }))
-            .children(
-                views
-                    .iter()
-                    .map(|(_, label, icon)| Tab::new().icon(*icon).label(*label)),
-            );
+            .children(views.iter().map(|(_, label, icon)| {
+                // `Tab::icon` draws the icon instead of the label; the prefix slot keeps both.
+                Tab::new().prefix(Icon::new(*icon).xsmall()).label(*label)
+            }));
         let table = self.hits.as_ref().filter(|_| self.view == View::Table);
         let outline = self.tree.as_ref().filter(|_| self.view == View::Tree);
         div()
@@ -1647,6 +1939,17 @@ const SEND_SHORTCUT: &str = "Cmd+Enter";
 #[cfg(not(target_os = "macos"))]
 const SEND_SHORTCUT: &str = "Ctrl+Enter";
 
+/// Requests offered before the first result: one shape per row, all read-only, so the examples
+/// are safe on every connection.
+const SAMPLES: [(&str, &str); 3] = [
+    ("Cluster health", "GET _cluster/health\n"),
+    ("List indices", "GET _cat/indices?v\n"),
+    (
+        "Search everything",
+        "POST _search\n{\n  \"query\": {\n    \"match_all\": {}\n  }\n}\n",
+    ),
+];
+
 fn human_size(bytes: usize) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),
@@ -1663,6 +1966,8 @@ impl Render for Console {
         let sidebar = self.http.is_some() && self.sidebar_open;
         // Both halves are always laid out: the panel library keeps the editor's full width when a hidden panel appears later.
         let response = matches!(self.run, Run::Done { .. });
+        // Idle is the only state with neither a result nor a request in flight to report.
+        let empty = matches!(self.run, Run::Idle);
         let sidebar_width = size(20.0);
         let tool = |id: &'static str, icon: IconName, tip: &'static str| {
             Button::new(id).ghost().small().icon(icon).tooltip(tip)
@@ -1675,8 +1980,9 @@ impl Render for Console {
             theme.danger
         };
         let surface = theme.background;
-        // JetBrains Islands look: flat 8px-rounded panels on a darker ground, no border or shadow, separated by a 4px gap.
-        let radius = px(8.);
+        // JetBrains Islands look: flat theme-rounded panels on a darker ground, no border or shadow,
+        // separated by a small gap.
+        let radius = theme.radius;
         let ground = theme.background.blend(theme.foreground.opacity(0.07));
         let card = move || {
             div()
@@ -1760,13 +2066,22 @@ impl Render for Console {
             .on_action(cx.listener(|this, _: &Format, window, cx| this.format(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| this.newline(window, cx)))
             .on_action(cx.listener(|this, _: &CancelRequest, _, cx| this.cancel(cx)))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(-1, cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_active_tab(cx)))
             .on_action(cx.listener(|this, _: &ToggleTree, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleReadonly, _, cx| {
-                this.readonly = !this.readonly;
-                cx.notify();
+            .on_action(cx.listener(|this, _: &ToggleReadonly, _, cx| this.toggle_readonly(cx)))
+            .on_action(cx.listener(|this, _: &UseSystemAppearance, window, cx| {
+                this.set_theme(Pref::System, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseLightAppearance, window, cx| {
+                this.set_theme(Pref::Light, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseDarkAppearance, window, cx| {
+                this.set_theme(Pref::Dark, window, cx)
             }))
             .on_action(
                 cx.listener(|this, _: &ShowHistory, window, cx| this.show_history(window, cx)),
@@ -1798,7 +2113,9 @@ impl Render for Console {
                                     .child(self.render_tabs(cx))
                                     .child(
                                         div().flex_1().min_h_0().child(
-                                            h_resizable("editor-split")
+                                            // Stacked by default: a request is wider than it is tall, and the
+                                            // response beneath it keeps the full width for tables.
+                                            v_resizable("editor-split")
                                                 .child(
                                                     resizable_panel().child(
                                                         card().p_1p5().child(
@@ -1811,12 +2128,16 @@ impl Render for Console {
                                                 .child(
                                                     resizable_panel()
                                                         .size_range(size(16.0)..size(120.0))
-                                                        .child(div().size_full().pl_0p5().child(
-                                                            card().p_2().children(
-                                                                response.then(|| {
-                                                                    self.render_response(cx)
-                                                                }),
-                                                            ),
+                                                        .child(div().size_full().pt_0p5().child(
+                                                            card().p_2().child(if response {
+                                                                self.render_response(cx)
+                                                                    .into_any_element()
+                                                            } else if empty {
+                                                                self.render_empty_response(cx)
+                                                                    .into_any_element()
+                                                            } else {
+                                                                div().into_any_element()
+                                                            }),
                                                         )),
                                                 ),
                                         ),
@@ -1846,6 +2167,7 @@ mod tests {
     use super::*;
     use crate::lsp_client::sample_index;
     use gpui_kit::TestAppContext;
+    use gpui_kit::component::ThemeMode;
     use gpui_kit::test::TestWindowExt as _;
 
     /// Real editor, real provider, real server: typing a key prefix opens the menu and Enter inserts the key.
@@ -2005,5 +2327,355 @@ mod tests {
         let shown = cx.update(|cx| editor.read(cx).diagnostics().map(|d| d.len()));
         assert_eq!(shown, Some(1));
         assert_eq!(cx.update(|cx| console.read(cx).problems), Some(1));
+    }
+
+    /// A client that answers nothing; `switch_to` is handed a `Connected` directly, so the switch
+    /// itself needs no request.
+    fn cluster(name: &str) -> Connected {
+        let client = Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap();
+        Connected {
+            client: Arc::new(client),
+            version: [8, 19, 0],
+            meta: es_client::ClusterMeta::default(),
+            name: name.into(),
+        }
+    }
+
+    /// A connection switch must not leave the previous connection's tabs behind: clicking one
+    /// would resolve its console against the new connection and open empty. The outgoing text
+    /// must also stay with the connection it was typed in.
+    #[gpui_kit::test]
+    fn switching_connections_drops_the_previous_tabs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let client = LspClient::start(sample_index(), None, es_dsl_core::NoFields).unwrap();
+        let (window, console) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    let library = cx.new(|_| Library::blank());
+                    cx.new(|cx| {
+                        Console::new(
+                            "",
+                            sample_index(),
+                            client,
+                            library,
+                            PathBuf::from("unused.json"),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        let library = cx.update(|cx| console.read(cx).library.clone());
+        // c2 has its own default console.
+        cx.update(|cx| {
+            library.update(cx, |library, cx| {
+                library.set_console("c2", saved::AUTO_CONSOLE, "GET c2/_search", cx)
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.tabs = vec![saved::AUTO_CONSOLE.into(), "logs".into()];
+                this.active = "logs".into();
+            });
+            editor.update(cx, |state, cx| {
+                state.set_value("GET logs/_search", window, cx);
+                state.set_selected_range(0..0, cx);
+            });
+        })
+        .unwrap();
+        let done = cluster("c2");
+        // The switch hands `open_console` c2's own console and no inherited tab state.
+        let text = cx.update(|cx| console.update(cx, |this, cx| this.switch_to(&done, cx)));
+        assert_eq!(text.as_deref(), Some("GET c2/_search"));
+        cx.update(|cx| {
+            let console = console.read(cx);
+            assert_eq!(console.tabs, vec![saved::AUTO_CONSOLE.to_string()]);
+            assert!(console.active.is_empty());
+            assert!(console.panes.is_empty());
+            // The outgoing text stayed with c1 instead of moving to c2.
+            assert_eq!(
+                library.read(cx).console("c1", "logs").as_deref(),
+                Some("GET logs/_search")
+            );
+        });
+        // Finishing the switch opens c2's default console.
+        let text = text.unwrap();
+        cx.update(|cx| {
+            console.update(cx, |this, cx| {
+                this.open_console(saved::AUTO_CONSOLE.into(), text, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let console = console.read(cx);
+            assert_eq!(console.active, saved::AUTO_CONSOLE);
+            assert_eq!(console.tabs, vec![saved::AUTO_CONSOLE.to_string()]);
+        });
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).value().to_string()),
+            "GET c2/_search"
+        );
+        // Reconnecting the same cluster keeps the open tabs.
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.tabs = vec![saved::AUTO_CONSOLE.into(), "logs".into()];
+                this.active = "logs".into();
+            });
+        });
+        let again = cx.update(|cx| console.update(cx, |this, cx| this.switch_to(&done, cx)));
+        assert_eq!(again, None);
+        cx.update(|cx| {
+            assert_eq!(
+                console.read(cx).tabs,
+                vec![saved::AUTO_CONSOLE.to_string(), "logs".to_string()]
+            );
+        });
+    }
+
+    /// Disconnecting collapses the tabs to the default console but keeps the draft; a click on the
+    /// remaining tab must not load an empty console over it.
+    #[gpui_kit::test]
+    fn disconnecting_keeps_the_draft_and_collapses_the_tabs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let client = LspClient::start(sample_index(), None, es_dsl_core::NoFields).unwrap();
+        let (window, console) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    let library = cx.new(|_| Library::blank());
+                    cx.new(|cx| {
+                        Console::new(
+                            "",
+                            sample_index(),
+                            client,
+                            library,
+                            PathBuf::from("unused.json"),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        let library = cx.update(|cx| console.read(cx).library.clone());
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.tabs = vec![saved::AUTO_CONSOLE.into(), "logs".into()];
+                this.active = "logs".into();
+            });
+            editor.update(cx, |state, cx| {
+                state.set_value("GET logs/_search", window, cx);
+                state.set_selected_range(0..0, cx);
+            });
+        })
+        .unwrap();
+        cx.update(|cx| console.update(cx, |this, cx| this.disconnect(cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let console = console.read(cx);
+            assert_eq!(console.tabs, vec![saved::AUTO_CONSOLE.to_string()]);
+            assert_eq!(console.active, saved::AUTO_CONSOLE);
+            assert!(console.panes.is_empty());
+            assert_eq!(
+                library.read(cx).console("c1", "logs").as_deref(),
+                Some("GET logs/_search")
+            );
+        });
+        // Without a connection the tab has nothing to load; the draft stays.
+        cx.update(|cx| console.update(cx, |this, cx| this.select_tab(0, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).value().to_string()),
+            "GET logs/_search"
+        );
+    }
+
+    fn console_window(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<Console>) {
+        cx.update(gpui_kit::init);
+        let client = LspClient::start(sample_index(), None, es_dsl_core::NoFields).unwrap();
+        // Under the temp directory so the appearance choice this test saves stays out of the repo.
+        let connections = std::env::temp_dir().join("esdeck-test-connections.json");
+        cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                let library = cx.new(|_| Library::blank());
+                cx.new(|cx| {
+                    Console::new("", sample_index(), client, library, connections, window, cx)
+                })
+            })
+        })
+        .unwrap()
+    }
+
+    /// `Ctrl+Tab` and `Ctrl+Shift+Tab` move the selection and wrap at the ends.
+    #[gpui_kit::test]
+    fn cycling_tabs_wraps_around(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.tabs = vec!["console".into(), "logs".into(), "metrics".into()];
+                this.active = "console".into();
+            });
+        })
+        .unwrap();
+        let cycle = |cx: &mut TestAppContext, step: isize| {
+            cx.update(|cx| console.update(cx, |this, cx| this.cycle_tab(step, cx)));
+            cx.update(|cx| console.read(cx).active.clone())
+        };
+        assert_eq!(cycle(cx, 1), "logs");
+        assert_eq!(cycle(cx, 1), "metrics");
+        assert_eq!(cycle(cx, 1), "console", "wraps forward");
+        assert_eq!(cycle(cx, -1), "metrics", "wraps back");
+    }
+
+    /// A tab's close button closes that tab without selecting it first.
+    #[gpui_kit::test]
+    fn a_tab_close_button_closes_without_selecting(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.tabs = vec!["console".into(), "logs".into(), "metrics".into()];
+                this.active = "console".into();
+            });
+            window.render_frame(cx);
+            window.click(("close-tab", row_id("logs")), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let console = console.read(cx);
+            assert_eq!(
+                console.tabs,
+                vec!["console".to_string(), "metrics".to_string()]
+            );
+            assert_eq!(console.active, "console");
+        });
+    }
+
+    /// The toolbar button is the discoverable control; the status bar repeats the mode while it is
+    /// on, next to the response the mode protects.
+    #[gpui_kit::test]
+    fn the_toolbar_turns_readonly_on_and_the_status_bar_says_so(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            assert!(window.try_find("readonly-badge").is_none());
+            let off = window.try_find("readonly").unwrap();
+            assert!(off.label().unwrap().contains("Readonly is off"));
+            window.click("readonly", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(console.read(cx).readonly));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("readonly-badge").is_some());
+            // The state is spoken as well as shown: the button carries the same wording.
+            let on = window.try_find("readonly").unwrap();
+            assert!(on.label().unwrap().contains("Readonly is on"));
+        })
+        .unwrap();
+        // The native menu marks the mode with a check, which is its only icon; it is rebuilt on
+        // every toggle because a platform menu keeps what it was built with.
+        assert_eq!(menu_checked(cx, "Readonly"), Some(true));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("readonly", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(!console.read(cx).readonly));
+        assert_eq!(menu_checked(cx, "Readonly"), Some(false));
+    }
+
+    /// Whether the View menu item called `name` is checked, from the platform menu bar.
+    fn menu_checked(cx: &mut TestAppContext, name: &str) -> Option<bool> {
+        cx.update(|cx| {
+            cx.get_menus()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|menu| menu.name == "View")
+                .and_then(|menu| {
+                    menu.items.into_iter().find_map(|item| match item {
+                        gpui_kit::OwnedMenuItem::Action {
+                            name: item,
+                            checked,
+                            ..
+                        } if item == name => Some(checked),
+                        _ => None,
+                    })
+                })
+        })
+    }
+
+    /// The View menu actions change the theme immediately and remember the choice.
+    #[gpui_kit::test]
+    fn choosing_an_appearance_applies_and_remembers_it(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let path = cx.update(|cx| console.read(cx).appearance_file.clone());
+        let choose = |cx: &mut TestAppContext, pref: Pref| {
+            cx.update_window(window, |_, window, cx| {
+                console.update(cx, |this, cx| this.set_theme(pref, window, cx));
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| assert_eq!(cx.theme().mode, mode(pref)));
+            assert_eq!(Pref::load(&path), pref);
+        };
+        choose(cx, Pref::Dark);
+        choose(cx, Pref::Light);
+        // System follows the OS, which is light in the headless window.
+        choose(cx, Pref::System);
+        cx.update(|cx| assert_eq!(console.read(cx).theme, Pref::System));
+    }
+
+    /// The mode `pref` should produce in a headless window, which is light.
+    fn mode(pref: Pref) -> ThemeMode {
+        match pref {
+            Pref::Light | Pref::System => ThemeMode::Light,
+            Pref::Dark => ThemeMode::Dark,
+        }
+    }
+
+    /// An example in the empty response pane fills the editor and moves the cursor to the end, so
+    /// the sample can be sent straight away — even before a connection exists.
+    #[gpui_kit::test]
+    fn a_sample_request_fills_the_empty_editor(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            window.click(("sample-request", 0usize), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        cx.update(|cx| {
+            let state = editor.read(cx);
+            assert_eq!(state.value(), SAMPLES[0].1);
+            assert_eq!(state.cursor(), SAMPLES[0].1.len());
+        });
     }
 }

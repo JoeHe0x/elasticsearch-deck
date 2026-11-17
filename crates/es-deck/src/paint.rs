@@ -9,7 +9,7 @@ use gpui_kit::component::input::{
     EditorState, GutterDecoration, GutterDecorationCollection, RangeDecoration,
     RangeDecorationCollection, TextDecoration, TextDecorationCollection,
 };
-use gpui_kit::{App, Entity, FontWeight, HighlightStyle, Hsla};
+use gpui_kit::{App, Entity, FontWeight, HighlightStyle};
 
 pub struct Paint {
     colors: TextDecorationCollection,
@@ -60,14 +60,10 @@ impl Paint {
     }
 
     /// Frames `block`, or clears the frame. Callers skip unchanged ranges: setting notifies the editor.
-    /// Pale lavender: the default frame color is the editor foreground, which is near black.
+    /// The theme's accent follows light and dark; the editor's fallback is the foreground colour,
+    /// which is too heavy for a whole request.
     pub fn set_active(&self, block: Option<Range<usize>>, cx: &mut App) {
-        let color = Hsla {
-            h: 0.70,
-            s: 0.75,
-            l: 0.78,
-            a: 1.0,
-        };
+        let color = cx.theme().blue.opacity(0.7);
         let frame = block.map(|r| RangeDecoration::new(r).with_color(color));
         self.active.set(frame.into_iter().collect(), cx);
     }
