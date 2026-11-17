@@ -19,7 +19,9 @@ use gpui_kit::component::dialog::AlertDialog;
 use gpui_kit::component::input::{Editor, EditorState, Enter, Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::list::{List, ListEvent, ListState};
-use gpui_kit::component::menu::{AppMenuBar, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{
+    AppMenuBar, ContextMenuExt as _, DropdownMenu as _, PopupMenuItem,
+};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -32,7 +34,8 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
-    ParentElement as _, Render, SharedString, Styled as _, Task, Window, actions, div, px, rems,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
+    Window, actions, div, px, rems,
 };
 
 use crate::completion::{LspCompletion, LspHover};
@@ -201,6 +204,10 @@ pub struct Console {
     refresh: Option<Task<()>>,
     /// A pending check; replaced (so cancelled) by the next edit.
     lint: Option<Task<()>>,
+    /// The console the editor shows, which the autosave writes to.
+    active: String,
+    /// The consoles shown as tabs above the editor, in opening order; `active` is one of them.
+    tabs: Vec<String>,
     paint: Paint,
     menu_bar: Entity<AppMenuBar>,
 }
@@ -258,13 +265,29 @@ impl Console {
         let targets = cx.new(|cx| ListState::new(Targets::default(), window, cx));
         cx.subscribe(&targets, |this, list, ev: &ListEvent, cx| {
             if let ListEvent::Confirm(ix) = ev {
+                let mut double = false;
                 let picked = list.update(cx, |list, cx| {
+                    double = list.delegate_mut().double_click(*ix);
                     let picked = list.delegate_mut().activate(*ix);
                     cx.notify();
                     picked
                 });
-                if let Some((folder, text)) = picked {
-                    this.open_row(folder, text, cx);
+                let label = list
+                    .read(cx)
+                    .delegate()
+                    .selected()
+                    .map(|(_, row)| row.label.clone());
+                if let (Some((folder, text)), Some(label)) = (picked, label) {
+                    match folder {
+                        Folder::Consoles => this.open_console(label, text, cx),
+                        // A single click only selects; the second one opens the object's console.
+                        Folder::Indices | Folder::Aliases => {
+                            if double {
+                                this.open_named(label, cx);
+                            }
+                        }
+                        _ => this.append_request(text, false, cx),
+                    }
                 }
             }
         })
@@ -325,6 +348,8 @@ impl Console {
             meta: None,
             refresh: None,
             lint: None,
+            active: saved::AUTO_CONSOLE.into(),
+            tabs: vec![saved::AUTO_CONSOLE.into()],
             paint,
             menu_bar: AppMenuBar::new(cx),
         }
@@ -369,6 +394,7 @@ impl Console {
                 // This task is replaced by every edit, so the draft is saved once typing pauses.
                 this.library
                     .update(cx, |library, cx| library.save_draft(text.clone(), cx));
+                this.save_active(cx);
                 (text, this.client.clone())
             }) else {
                 return;
@@ -602,16 +628,18 @@ impl Console {
         cx.notify();
     }
 
-    /// A click in the tree: consoles replace the editor text, everything else is appended.
-    fn open_row(&mut self, folder: Folder, text: String, cx: &mut Context<Self>) {
-        if folder != Folder::Consoles {
-            self.append_request(text, false, cx);
-            return;
-        }
+    /// Shows the console called `name` in the editor and makes it the one that autosaves.
+    fn open_console(&mut self, name: String, text: String, cx: &mut Context<Self>) {
         let editor = self.editor.clone();
         let Some(window) = cx.active_window() else {
             return;
         };
+        // The pause before the autosave would otherwise lose the last edits of the console being left.
+        self.save_active(cx);
+        if !self.tabs.contains(&name) {
+            self.tabs.push(name.clone());
+        }
+        self.active = name;
         let _ = window.update(cx, |_, window, cx| {
             editor.update(cx, |state, cx| {
                 state.set_value(text, window, cx);
@@ -619,6 +647,137 @@ impl Console {
             });
         });
         self.lint(cx);
+    }
+
+    /// Opens the console named after an index or alias: created when new, otherwise the search
+    /// request is added at its end.
+    fn open_named(&mut self, name: String, cx: &mut Context<Self>) {
+        let search = search_text(&name);
+        let conn = self.connection_name();
+        let text = match self.library.read(cx).console(&conn, &name) {
+            Some(old) if old.contains(&search) => old,
+            Some(old) => format!("{}\n\n{search}", old.trim_end()),
+            None => search,
+        };
+        self.open_console(name, text, cx);
+    }
+
+    /// Switches to the tab at `ix`, loading its saved text.
+    fn select_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(name) = self.tabs.get(ix).cloned() else {
+            return;
+        };
+        let text = self
+            .library
+            .read(cx)
+            .console(&self.connection_name(), &name)
+            .unwrap_or_default();
+        self.open_console(name, text, cx);
+    }
+
+    /// Closes the tab at `ix`; the last one stays. The console itself stays saved in the tree.
+    fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.tabs.len() < 2 || ix >= self.tabs.len() {
+            return;
+        }
+        let closed_active = self.tabs[ix] == self.active;
+        self.save_active(cx);
+        self.tabs.remove(ix);
+        if closed_active {
+            self.select_tab(ix.saturating_sub(1), cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// One rounded tab per console: icon, name and a quiet close mark, the active one framed in blue.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let conn = self.connection_name();
+        let closable = self.tabs.len() > 1;
+        let console = cx.entity();
+        let theme = cx.theme();
+        let (muted, radius, blue) = (theme.muted_foreground, theme.radius, theme.blue);
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .overflow_x_hidden()
+            .children(self.tabs.iter().enumerate().map(|(ix, name)| {
+                let label = if conn.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name} [{conn}]")
+                };
+                let tab = div()
+                    .id(("console-tab", ix))
+                    .flex_none()
+                    .h(rems(1.75))
+                    .px_2()
+                    .text_sm()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(radius)
+                    .border_1()
+                    .border_color(gpui_kit::transparent_black())
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_tab(ix, cx)))
+                    .child(
+                        Icon::new(IconName::SquareTerminal)
+                            .small()
+                            .text_color(muted),
+                    )
+                    .child(div().whitespace_nowrap().child(SharedString::from(label)));
+                let tab = if *name == self.active {
+                    tab.bg(blue.opacity(0.12)).border_color(blue.opacity(0.45))
+                } else {
+                    tab
+                };
+                let (rename, delete) = (console.clone(), console.clone());
+                let (rename_name, delete_name) = (name.clone(), name.clone());
+                tab.children(closable.then(|| {
+                    div()
+                        .id(("close-tab", ix))
+                        .size_4()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .text_color(muted)
+                        .hover(|s| s.bg(muted.opacity(0.2)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(ix, cx);
+                        }))
+                        .child(Icon::new(IconName::Close).size_3())
+                }))
+                .context_menu(move |menu, _, _| {
+                    let (rename, rename_name) = (rename.clone(), rename_name.clone());
+                    let (delete, delete_name) = (delete.clone(), delete_name.clone());
+                    menu.item(
+                        PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
+                            let name = rename_name.clone();
+                            rename.update(cx, |this, cx| this.rename_console(name, window, cx))
+                        }),
+                    )
+                    .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+                        let name = delete_name.clone();
+                        delete.update(cx, |this, cx| this.delete_console(name, cx))
+                    }))
+                })
+            }))
+    }
+
+    fn save_active(&mut self, cx: &mut Context<Self>) {
+        let (name, text) = (self.connection_name(), self.editor.read(cx).value());
+        // Before a connection is chosen, or after the open console was deleted, there is none to keep.
+        if !name.is_empty() && !self.active.is_empty() {
+            let active = self.active.clone();
+            self.library.update(cx, |library, cx| {
+                library.set_console(&name, &active, &text, cx)
+            });
+        }
     }
 
     /// Appends a request to the editor, puts the cursor on its first line and checks the document.
@@ -733,38 +892,47 @@ impl Console {
         self.store(Kind::Console, text, cx);
     }
 
-    /// The saved item selected in the tree, as its kind, text and label.
-    fn selected_saved(&self, cx: &Context<Self>) -> Option<(Kind, String, String)> {
-        let targets = self.targets.read(cx);
-        let (folder, row) = targets.delegate().selected()?;
-        let kind = match folder {
-            Folder::Consoles => Kind::Console,
-            _ => return None,
-        };
-        Some((kind, row.text.clone(), row.label.clone()))
-    }
-
-    /// Removes the saved item selected in the tree; other rows are not deletable.
-    fn delete_saved(&mut self, cx: &mut Context<Self>) {
-        let Some((kind, text, _)) = self.selected_saved(cx) else {
+    /// Removes the console called `name`, closing its tab.
+    fn delete_console(&mut self, name: String, cx: &mut Context<Self>) {
+        let conn = self.connection_name();
+        let Some(text) = self.library.read(cx).console(&conn, &name) else {
             return;
         };
-        let name = self.connection_name();
+        let was_active = name == self.active;
+        // Without this the autosave would write the open console straight back.
+        if was_active {
+            self.active.clear();
+        }
         self.library.update(cx, |library, cx| {
-            library.remove_saved(&name, kind, &text, cx)
+            library.remove_saved(&conn, Kind::Console, &text, cx)
         });
+        let Some(ix) = self.tabs.iter().position(|t| *t == name) else {
+            return;
+        };
+        if self.tabs.len() > 1 {
+            self.tabs.remove(ix);
+            if was_active {
+                self.select_tab(ix.saturating_sub(1), cx);
+            }
+        } else if was_active {
+            // The only tab stays, empty; an empty console is never saved, so it stays deleted.
+            self.open_console(name, String::new(), cx);
+        }
+        cx.notify();
     }
 
-    /// Asks for a new name for the selected saved item.
-    fn rename_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((kind, text, label)) = self.selected_saved(cx) else {
+    /// Asks for a new name for the console called `old`.
+    fn rename_console(&mut self, old: String, window: &mut Window, cx: &mut Context<Self>) {
+        let conn = self.connection_name();
+        let Some(text) = self.library.read(cx).console(&conn, &old) else {
             return;
         };
         let input = cx.new(|cx| InputState::new(window, cx));
-        input.update(cx, |s, cx| s.set_value(label, window, cx));
+        input.update(cx, |s, cx| s.set_value(old.clone(), window, cx));
         let console = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
-            let (input, console, text) = (input.clone(), console.clone(), text.clone());
+            let (input, console) = (input.clone(), console.clone());
+            let (old, text) = (old.clone(), text.clone());
             dialog.title("Rename").child(
                 div()
                     .flex()
@@ -780,13 +948,33 @@ impl Console {
                                 .on_click({
                                     let input = input.clone();
                                     move |_, window, cx| {
-                                        let name = input.read(cx).value().to_string();
-                                        let (console, text) = (console.clone(), text.clone());
+                                        let new = input.read(cx).value().trim().to_string();
+                                        let new: String = new.chars().take(60).collect();
+                                        let (console, old, text) =
+                                            (console.clone(), old.clone(), text.clone());
                                         console.update(cx, |this, cx| {
                                             let conn = this.connection_name();
-                                            this.library.update(cx, |library, cx| {
-                                                library.rename_saved(&conn, kind, &text, &name, cx)
+                                            let done = this.library.update(cx, |library, cx| {
+                                                library.rename_saved(
+                                                    &conn,
+                                                    Kind::Console,
+                                                    &text,
+                                                    &new,
+                                                    cx,
+                                                );
+                                                library.console(&conn, &new).is_some()
                                             });
+                                            // Tabs and the autosave follow the console by name.
+                                            if done {
+                                                for t in
+                                                    this.tabs.iter_mut().chain([&mut this.active])
+                                                {
+                                                    if *t == old {
+                                                        *t = new.clone();
+                                                    }
+                                                }
+                                            }
+                                            cx.notify();
                                         });
                                         window.close_dialog(cx);
                                     }
@@ -923,6 +1111,15 @@ impl Console {
         self.refresh_history(cx);
         self.refresh_saved(cx);
         self.load_catalog(cx);
+        // The connection's own console comes back; a connection without one keeps the editor text.
+        let console = self
+            .library
+            .read(cx)
+            .console(&done.name, saved::AUTO_CONSOLE);
+        match console {
+            Some(text) => self.open_console(saved::AUTO_CONSOLE.into(), text, cx),
+            None => self.active = saved::AUTO_CONSOLE.into(),
+        }
         self.editor.update(cx, |state, _| install(state, &client));
         self.lint(cx);
         let (http, meta) = (done.client.clone(), done.meta.clone());
@@ -1089,6 +1286,14 @@ impl Console {
                     .disabled(!sending)
                     .tooltip("Cancel the request in flight")
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+            )
+            .child(
+                Button::new("save-console")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Save)
+                    .tooltip("Save a copy of the editor as a console")
+                    .on_click(cx.listener(|this, _, _, cx| this.save_console(cx))),
             )
             .child(
                 Button::new("format")
@@ -1392,30 +1597,6 @@ impl Render for Console {
             .items_center()
             .gap_0p5()
             .px_1()
-            .child(
-                tool(
-                    "save-console",
-                    IconName::Save,
-                    "Save the whole editor as a console",
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.save_console(cx))),
-            )
-            .child(
-                tool(
-                    "rename-saved",
-                    IconName::Pencil,
-                    "Rename the selected saved item",
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.rename_saved(window, cx))),
-            )
-            .child(
-                tool(
-                    "delete-saved",
-                    IconName::Trash,
-                    "Delete the selected saved item",
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.delete_saved(cx))),
-            )
             .child(div().flex_1())
             .child(
                 tool("tree-filter", IconName::Search, "Filter the tree")
@@ -1503,7 +1684,15 @@ impl Render for Console {
                             resizable_panel().child(
                                 card()
                                     .p_1p5()
-                                    .child(Editor::new(&self.editor).bordered(false).h_full()),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(self.render_tabs(cx))
+                                    .child(
+                                        div().flex_1().min_h_0().child(
+                                            Editor::new(&self.editor).bordered(false).h_full(),
+                                        ),
+                                    ),
                             ),
                         )
                         .child(

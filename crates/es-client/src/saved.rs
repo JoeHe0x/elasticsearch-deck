@@ -56,6 +56,44 @@ pub fn add(list: &mut Vec<Saved>, item: Saved) -> bool {
     true
 }
 
+/// The console every connection starts with.
+pub const AUTO_CONSOLE: &str = "console";
+
+/// Stores `text` as the connection's console called `name`, creating it on first use.
+/// Returns false when nothing changed: the text is empty, may hold credentials, or is already stored.
+pub fn set_console(
+    list: &mut Vec<Saved>,
+    connection: &str,
+    name: &str,
+    text: &str,
+    at: u64,
+) -> bool {
+    if text.trim().is_empty() || sensitive(text) {
+        return false;
+    }
+    let found = list
+        .iter_mut()
+        .find(|s| s.connection == connection && s.kind == Kind::Console && s.name == name);
+    match found {
+        Some(s) if s.text == text => false,
+        Some(s) => {
+            s.text = text.into();
+            s.at = at;
+            true
+        }
+        None => {
+            list.push(Saved {
+                connection: connection.into(),
+                kind: Kind::Console,
+                name: name.into(),
+                text: text.into(),
+                at,
+            });
+            true
+        }
+    }
+}
+
 /// Renames the saved item with this connection, kind and text. False for an empty name or no match.
 pub fn rename(list: &mut [Saved], connection: &str, kind: Kind, text: &str, name: &str) -> bool {
     let name = name.trim();
@@ -127,5 +165,28 @@ mod tests {
             "n"
         ));
         assert_eq!(name_of("\n  GET a/_search  \n{}"), "GET a/_search");
+    }
+
+    #[test]
+    fn a_console_is_one_item_per_connection_and_name_and_follows_the_text() {
+        let mut list = Vec::new();
+        assert!(set_console(&mut list, "c", AUTO_CONSOLE, "GET a", 1));
+        assert!(
+            !set_console(&mut list, "c", AUTO_CONSOLE, "GET a", 2),
+            "unchanged"
+        );
+        assert!(set_console(&mut list, "c", AUTO_CONSOLE, "GET b", 3));
+        assert!(set_console(&mut list, "d", AUTO_CONSOLE, "GET b", 3));
+        assert!(!set_console(
+            &mut list,
+            "c",
+            AUTO_CONSOLE,
+            "PUT _security/user/u",
+            4
+        ));
+        assert!(!set_console(&mut list, "c", AUTO_CONSOLE, "  ", 4));
+        assert!(set_console(&mut list, "c", "users", "GET users", 5));
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].text, "GET b");
     }
 }

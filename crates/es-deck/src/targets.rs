@@ -99,6 +99,8 @@ pub struct Targets {
     selected: Option<IndexPath>,
     /// Folders the user collapsed, by slot; everything but the indices starts closed.
     collapsed: [bool; 7],
+    /// The last activated line and when, to tell a double click from two clicks.
+    last_click: Option<(usize, std::time::Instant)>,
 }
 
 impl Default for Targets {
@@ -110,6 +112,7 @@ impl Default for Targets {
             lines: Vec::new(),
             selected: None,
             collapsed: FOLDERS.map(|f| f != Folder::Indices),
+            last_click: None,
         };
         t.relayout();
         t
@@ -140,6 +143,16 @@ impl Targets {
             Line::Item(slot, i) => Some((FOLDERS[*slot], self.shown[*slot].get(*i)?)),
             Line::Folder(_) => None,
         }
+    }
+
+    /// Whether this activation of the line follows another one on it within the double-click time.
+    pub fn double_click(&mut self, ix: IndexPath) -> bool {
+        let now = std::time::Instant::now();
+        let double = self.last_click.is_some_and(|(row, at)| {
+            row == ix.row && now.duration_since(at) < std::time::Duration::from_millis(400)
+        });
+        self.last_click = (!double).then_some((ix.row, now));
+        double
     }
 
     /// Enter or click: a folder line opens or closes, a row returns its folder and text.
@@ -339,6 +352,16 @@ mod tests {
         assert_eq!(t.activate(at(4)), None);
         assert_eq!(t.lines.len(), 5, "nodes closed again");
         assert_eq!(t.activate(at(2)), Some((Folder::Indices, "GET a".into())));
+    }
+
+    #[test]
+    fn a_second_activation_of_the_same_line_is_a_double_click() {
+        let mut t = Targets::default();
+        assert!(!t.double_click(at(1)));
+        assert!(t.double_click(at(1)));
+        assert!(!t.double_click(at(1)), "a third click starts over");
+        assert!(!t.double_click(at(2)));
+        assert!(!t.double_click(at(1)), "another line resets it");
     }
 
     #[test]

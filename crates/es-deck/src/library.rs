@@ -68,6 +68,13 @@ impl Library {
     }
 
     /// The saved items of one connection and kind, in saving order.
+    /// The text of one connection's console called `name`.
+    pub fn console(&self, connection: &str, name: &str) -> Option<String> {
+        self.saved(connection, Kind::Console)
+            .find(|s| s.name == name)
+            .map(|s| s.text.clone())
+    }
+
     pub fn saved(&self, connection: &str, kind: Kind) -> impl Iterator<Item = &Saved> {
         let connection = connection.to_string();
         self.saved
@@ -91,6 +98,22 @@ impl Library {
             self.persist_saved(cx);
         }
         added
+    }
+
+    /// Keeps the connection's console called `name` equal to the editor text.
+    pub fn set_console(
+        &mut self,
+        connection: &str,
+        name: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if saved::set_console(&mut self.saved, connection, name, text, at) {
+            self.persist_saved(cx);
+        }
     }
 
     pub fn remove_saved(
