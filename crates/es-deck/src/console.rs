@@ -1358,9 +1358,10 @@ impl Render for Console {
         } else {
             theme.danger
         };
-        let (radius, surface) = (theme.radius_lg, theme.background);
-        // Islands: panels float as raised cards on a slightly darker window ground.
-        let ground = theme.background.blend(theme.foreground.opacity(0.09));
+        let surface = theme.background;
+        // JetBrains Islands look: flat 8px-rounded panels on a darker ground, no border or shadow, separated by a 4px gap.
+        let radius = px(8.);
+        let ground = theme.background.blend(theme.foreground.opacity(0.07));
         let card = move || {
             div()
                 .size_full()
@@ -1485,7 +1486,7 @@ impl Render for Console {
             .child(
                 // The tree keeps its width: a drag on another handle never takes space from it. Panels clip their content and the editors do not wrap, so a narrower panel
                 // hides text instead of reflowing it.
-                div().flex_1().min_h_0().mx_2().mb_2().child(
+                div().flex_1().min_h_0().mx_1().mb_1().child(
                     h_resizable("console-split")
                         .child(
                             resizable_panel()
@@ -1493,7 +1494,7 @@ impl Render for Console {
                                 .size(sidebar_width)
                                 .fixed()
                                 .size_range(size(16.0)..size(40.0))
-                                .child(div().size_full().pr_2().child(targets)),
+                                .child(div().size_full().pr_0p5().child(targets)),
                         )
                         .child(
                             resizable_panel().child(
@@ -1510,7 +1511,7 @@ impl Render for Console {
                                 .child(
                                     div()
                                         .size_full()
-                                        .pl_2()
+                                        .pl_0p5()
                                         .child(card().p_2().child(self.render_response(cx))),
                                 ),
                         ),
