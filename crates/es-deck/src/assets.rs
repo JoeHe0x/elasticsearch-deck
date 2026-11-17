@@ -59,3 +59,27 @@ impl AssetSource for AppAssets {
         Ok(paths)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::assets::IconName;
+
+    /// An icon the app draws itself has to be either a kit default or listed in `ExtraIcons`;
+    /// otherwise the asset source returns nothing and the control renders as a blank button.
+    #[test]
+    fn the_icons_the_console_draws_itself_are_bundled() {
+        for name in [
+            IconName::ChevronDown,
+            IconName::ChevronUp,
+            IconName::Maximize,
+            IconName::Minimize,
+        ] {
+            let path = name.path();
+            assert!(
+                AppAssets.load(path.as_ref()).unwrap().is_some(),
+                "{path} is not in the asset source"
+            );
+        }
+    }
+}

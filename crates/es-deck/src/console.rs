@@ -23,7 +23,7 @@ use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::menu::{
     AppMenuBar, ContextMenuExt as _, DropdownMenu as _, PopupMenuItem,
 };
-use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{DataTable, TableState};
@@ -159,6 +159,15 @@ enum View {
     Json,
 }
 
+/// How the editor and the response share their height. Collapsed keeps the response's header
+/// row so the way back stays one click away; maximized hides the editor while data is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultLayout {
+    Split,
+    Collapsed,
+    Maximized,
+}
+
 /// Where the last request stands. The body itself lives in the response editor.
 enum Run {
     Idle,
@@ -228,6 +237,10 @@ pub struct Console {
     catalog: Option<Task<()>>,
     history_list: Entity<ListState<HistoryList>>,
     view: View,
+    /// How the editor and the response share their height.
+    result_layout: ResultLayout,
+    /// The editor/response split, owned here so its sizes survive the other layouts.
+    split: Entity<ResizableState>,
     /// Blocks every request that would change the cluster; per session, off at start.
     readonly: bool,
     /// The appearance the user chose; only `System` lets later OS changes through.
@@ -397,6 +410,7 @@ impl Console {
         .detach();
         // The editor's draft is restored on startup, so the connection it ran against is too.
         panel.update(cx, |p, cx| p.reconnect_last(window, cx));
+        let split = cx.new(|_| ResizableState::default());
         Self {
             editor,
             panel,
@@ -411,6 +425,8 @@ impl Console {
             catalog: None,
             history_list,
             view: View::Table,
+            result_layout: ResultLayout::Split,
+            split,
             readonly: false,
             theme,
             appearance_file,
@@ -580,6 +596,8 @@ impl Console {
         }
         self.remember(&req, cx);
         self.run = Run::Sending;
+        // A new answer should be visible even when the last one was folded away.
+        self.result_layout = ResultLayout::Split;
         let started = Instant::now();
         let call = http.send(req);
         self.sending = Some(cx.spawn_in(window, async move |this, cx| {
@@ -852,6 +870,24 @@ impl Console {
         self.readonly = !self.readonly;
         // The menu item carries a check mark for the mode, so it has to be rebuilt with it.
         self.refresh_menus(cx);
+        cx.notify();
+    }
+
+    /// Folds the response away, leaving only its header row so the editor takes the freed height.
+    fn toggle_result_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.result_layout = match self.result_layout {
+            ResultLayout::Collapsed => ResultLayout::Split,
+            _ => ResultLayout::Collapsed,
+        };
+        cx.notify();
+    }
+
+    /// Gives the response the whole height for reading data, or returns to the split.
+    fn toggle_result_maximized(&mut self, cx: &mut Context<Self>) {
+        self.result_layout = match self.result_layout {
+            ResultLayout::Maximized => ResultLayout::Split,
+            _ => ResultLayout::Maximized,
+        };
         cx.notify();
     }
 
@@ -1782,8 +1818,9 @@ impl Console {
             }))
     }
 
-    /// The response viewer: view tabs and actions above the body. Only built once a response exists.
-    fn render_response(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The response viewer: view tabs and actions above the body. Only built once a response
+    /// exists. `show_body` is false while the response is collapsed to its header row.
+    fn render_response(&self, cx: &mut Context<Self>, show_body: bool) -> impl IntoElement {
         let theme = cx.theme();
         let palette = TreePalette {
             key: theme.blue,
@@ -1817,45 +1854,82 @@ impl Console {
                 }
             }))
             .children(views.iter().map(|(_, label, icon)| {
-                // `Tab::icon` draws the icon instead of the label; the prefix slot keeps both.
-                Tab::new().prefix(Icon::new(*icon).xsmall()).label(*label)
+                // `Tab::icon` draws the icon alone; the accessible name keeps the view's
+                // meaning for tests and screen readers.
+                Tab::new()
+                    .icon(Icon::new(*icon).xsmall())
+                    .aria_label(*label)
             }));
         let table = self.hits.as_ref().filter(|_| self.view == View::Table);
         let outline = self.tree.as_ref().filter(|_| self.view == View::Tree);
-        div()
-            .size_full()
+        let mut actions = div()
             .flex()
-            .flex_col()
-            .gap_2()
+            .gap_1()
+            .children((self.view == View::Tree).then(|| {
+                Button::new("copy-path")
+                    .ghost()
+                    .icon(IconName::Copy)
+                    .small()
+                    .label("Copy path")
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_path(cx)))
+            }))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(tabs)
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .children((self.view == View::Tree).then(|| {
-                                Button::new("copy-path")
-                                    .ghost()
-                                    .icon(IconName::Copy)
-                                    .small()
-                                    .label("Copy path")
-                                    .on_click(cx.listener(|this, _, _, cx| this.copy_path(cx)))
-                            }))
-                            .child(
-                                Button::new("save-response")
-                                    .ghost()
-                                    .icon(IconName::Download)
-                                    .small()
-                                    .label("Save…")
-                                    .on_click(cx.listener(|this, _, _, cx| this.save_response(cx))),
-                            ),
-                    ),
+                Button::new("save-response")
+                    .ghost()
+                    .icon(IconName::Download)
+                    .small()
+                    .label("Save…")
+                    .on_click(cx.listener(|this, _, _, cx| this.save_response(cx))),
+            );
+        // Maximized, the response already has the height; the way out is to restore the split.
+        actions = if self.result_layout == ResultLayout::Maximized {
+            actions.child(
+                Button::new("minimize-result")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Minimize)
+                    .tooltip("Restore the split view")
+                    .accessibility_label("Restore the split view")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_result_maximized(cx))),
             )
-            .child(
+        } else {
+            // The result lives below the editor: folding it moves the top edge down, and
+            // expanding moves it back up, so the chevrons follow that direction.
+            let (icon, tip) = if show_body {
+                (IconName::ChevronDown, "Collapse the result")
+            } else {
+                (IconName::ChevronUp, "Expand the result")
+            };
+            actions
+                .child(
+                    Button::new("maximize-result")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Maximize)
+                        .tooltip("Maximize the result")
+                        .accessibility_label("Maximize the result")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_result_maximized(cx))),
+                )
+                .child(
+                    Button::new("collapse-result")
+                        .ghost()
+                        .small()
+                        .icon(icon)
+                        .tooltip(tip)
+                        .accessibility_label(tip)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_result_collapsed(cx))),
+                )
+        };
+        let mut viewer = div().size_full().flex().flex_col().gap_2().child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(tabs)
+                .child(actions),
+        );
+        if show_body {
+            viewer = viewer.child(
                 div().flex_1().min_h_0().child(match (table, outline) {
                     (Some(t), _) => DataTable::new(t).stripe(true).into_any_element(),
                     (None, Some(t)) => tree(t, move |_, entry, selected, _, _| {
@@ -1925,7 +1999,9 @@ impl Console {
                         .h_full()
                         .into_any_element(),
                 }),
-            )
+            );
+        }
+        viewer
     }
 }
 
@@ -2111,37 +2187,77 @@ impl Render for Console {
                                     .flex()
                                     .flex_col()
                                     .child(self.render_tabs(cx))
-                                    .child(
-                                        div().flex_1().min_h_0().child(
+                                    .child(div().flex_1().min_h_0().child({
+                                        // Nothing to analyze yet: the editor keeps the height.
+                                        let layout = if response {
+                                            self.result_layout
+                                        } else {
+                                            ResultLayout::Split
+                                        };
+                                        let show_body = layout != ResultLayout::Collapsed;
+                                        let editor_card =
+                                            card().id("editor-card").test_support().p_1p5().child(
+                                                Editor::new(&self.editor).bordered(false).h_full(),
+                                            );
+                                        let content = if response {
+                                            self.render_response(cx, show_body).into_any_element()
+                                        } else if empty {
+                                            self.render_empty_response(cx).into_any_element()
+                                        } else {
+                                            div().into_any_element()
+                                        };
+                                        let response_card = card()
+                                            .id("result-card")
+                                            .test_support()
+                                            .p_2()
+                                            .child(content);
+                                        match layout {
                                             // Stacked by default: a request is wider than it is tall, and the
                                             // response beneath it keeps the full width for tables.
-                                            v_resizable("editor-split")
-                                                .child(
-                                                    resizable_panel().child(
-                                                        card().p_1p5().child(
-                                                            Editor::new(&self.editor)
-                                                                .bordered(false)
-                                                                .h_full(),
-                                                        ),
-                                                    ),
-                                                )
+                                            ResultLayout::Split => v_resizable("editor-split")
+                                                .with_state(&self.split)
+                                                .child(resizable_panel().child(editor_card))
                                                 .child(
                                                     resizable_panel()
                                                         .size_range(size(16.0)..size(120.0))
-                                                        .child(div().size_full().pt_0p5().child(
-                                                            card().p_2().child(if response {
-                                                                self.render_response(cx)
-                                                                    .into_any_element()
-                                                            } else if empty {
-                                                                self.render_empty_response(cx)
-                                                                    .into_any_element()
-                                                            } else {
-                                                                div().into_any_element()
-                                                            }),
-                                                        )),
-                                                ),
-                                        ),
-                                    ),
+                                                        .child(
+                                                            div()
+                                                                .size_full()
+                                                                .pt_0p5()
+                                                                .child(response_card),
+                                                        ),
+                                                )
+                                                .into_any_element(),
+                                            // Folded away: only the response's header row stays, at the
+                                            // bottom, so the editor owns the rest of the height. Its
+                                            // card must size to that row rather than to the whole column.
+                                            ResultLayout::Collapsed => div()
+                                                .size_full()
+                                                .flex()
+                                                .flex_col()
+                                                .child(div().flex_1().min_h_0().child(editor_card))
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .pt_0p5()
+                                                        .child(response_card.h_auto()),
+                                                )
+                                                .into_any_element(),
+                                            // The response alone, for reading the data.
+                                            ResultLayout::Maximized => div()
+                                                .size_full()
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_h_0()
+                                                        .pt_0p5()
+                                                        .child(response_card),
+                                                )
+                                                .into_any_element(),
+                                        }
+                                    })),
                             ),
                         ),
                 ),
@@ -2571,6 +2687,128 @@ mod tests {
             );
             assert_eq!(console.active, "console");
         });
+    }
+
+    /// The result folds to its header row and back, and takes the whole height for reading.
+    #[gpui_kit::test]
+    fn the_result_folds_to_its_header_and_maximizes(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let (split_y, split_height, split_editor_height) = cx
+            .update_window(window, |_, window, cx| {
+                window.activate_window();
+                console.update(cx, |this, cx| {
+                    this.run = Run::Done {
+                        status: 200,
+                        took: Duration::from_millis(3),
+                        bytes: 2,
+                        cut: false,
+                        found: None,
+                    };
+                    this.response
+                        .update(cx, |state, cx| state.set_value("{}", window, cx));
+                });
+                window.render_frame(cx);
+                let button = window
+                    .try_find("collapse-result")
+                    .expect("the split shows the collapse control");
+                let card = window.try_find("result-card").unwrap();
+                let editor = window.try_find("editor-card").unwrap();
+                (
+                    button.bounds().origin.y,
+                    card.bounds().size.height.as_f32(),
+                    editor.bounds().size.height.as_f32(),
+                )
+            })
+            .unwrap();
+
+        // Collapsed: the header row stays so the way back is one click away, and it sits at the
+        // bottom, below the editor that now owns the rest of the height.
+        cx.update_window(window, |_, window, cx| window.click("collapse-result", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(console.read(cx).result_layout, ResultLayout::Collapsed));
+        let (collapsed_y, collapsed_height, collapsed_editor_height) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("save-response").is_some());
+                let expand = window.try_find("collapse-result").unwrap();
+                assert!(expand.label().unwrap().contains("Expand the result"));
+                let card = window.try_find("result-card").unwrap();
+                let editor = window.try_find("editor-card").unwrap();
+                (
+                    expand.bounds().origin.y,
+                    card.bounds().size.height.as_f32(),
+                    editor.bounds().size.height.as_f32(),
+                )
+            })
+            .unwrap();
+        assert!(
+            collapsed_y > split_y,
+            "the folded result moves below the split's response header ({collapsed_y} vs {split_y})"
+        );
+        assert!(
+            collapsed_height < split_height,
+            "the folded result keeps only its header row ({collapsed_height} vs {split_height})"
+        );
+        assert!(
+            collapsed_height > 24.0,
+            "the folded result still shows a usable header row ({collapsed_height})"
+        );
+        assert!(
+            collapsed_editor_height > split_editor_height,
+            "the editor takes the folded result's height ({collapsed_editor_height} vs {split_editor_height})"
+        );
+
+        // Clicking the same control expands the body again.
+        cx.update_window(window, |_, window, cx| window.click("collapse-result", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(console.read(cx).result_layout, ResultLayout::Split));
+
+        // Maximized: the editor gives up its height; only the way back is offered.
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("maximize-result", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(console.read(cx).result_layout, ResultLayout::Maximized));
+        let (maximized_y, maximized_height) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("minimize-result").is_some());
+                assert!(window.try_find("collapse-result").is_none());
+                assert!(
+                    window.try_find("editor-card").is_none(),
+                    "the maximized result hides the editor"
+                );
+                let y = window
+                    .try_find("minimize-result")
+                    .unwrap()
+                    .bounds()
+                    .origin
+                    .y;
+                let height = window
+                    .try_find("result-card")
+                    .unwrap()
+                    .bounds()
+                    .size
+                    .height
+                    .as_f32();
+                window.click("minimize-result", cx);
+                (y, height)
+            })
+            .unwrap();
+        assert!(
+            maximized_y < split_y,
+            "the maximized result starts above the split's response header ({maximized_y} vs {split_y})"
+        );
+        assert!(
+            maximized_height > split_height,
+            "the maximized result takes the editor's height ({maximized_height} vs {split_height})"
+        );
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(console.read(cx).result_layout, ResultLayout::Split));
     }
 
     /// The toolbar button is the discoverable control; the status bar repeats the mode while it is
