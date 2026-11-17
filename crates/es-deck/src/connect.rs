@@ -13,7 +13,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::AlertDialog;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::radio::{Radio, RadioGroup};
-use gpui_kit::component::{ActiveTheme as _, Selectable as _, WindowExt as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, WindowExt as _};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _,
     Render, SharedString, Styled as _, Window, div,
@@ -48,6 +48,10 @@ pub struct ConnectPanel {
     auth: AuthKind,
     /// The last failure, shown next to the actions; cleared by the next attempt.
     failure: Option<SharedString>,
+    /// The saved connection the form was filled from; Save renames it instead of adding a new one.
+    editing: Option<String>,
+    /// The last success of Test or Save, shown where the failure would be.
+    notice: Option<SharedString>,
     busy: bool,
     saved: Vec<Connection>,
 }
@@ -73,6 +77,8 @@ impl ConnectPanel {
             insecure: false,
             auth: AuthKind::None,
             failure: None,
+            notice: None,
+            editing: None,
             busy: false,
             saved,
             path,
@@ -102,6 +108,11 @@ impl ConnectPanel {
         };
         set(&self.timeout, &secs, window, cx);
         (self.auth, self.insecure, self.failure) = (c.auth, c.insecure, None);
+        self.editing = self
+            .saved
+            .iter()
+            .any(|s| s.name == c.name)
+            .then(|| c.name.clone());
         cx.notify();
     }
 
@@ -115,7 +126,7 @@ impl ConnectPanel {
         let name = format!("{} copy", self.name(cx));
         self.name.update(cx, |s, cx| s.set_value(name, window, cx));
         self.secret.update(cx, |s, cx| s.set_value("", window, cx));
-        self.failure = None;
+        (self.failure, self.editing) = (None, None);
         cx.notify();
     }
 
@@ -143,7 +154,8 @@ impl ConnectPanel {
         self.start(conn, String::new(), true, window, cx);
     }
 
-    fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The form as a connection, plus the secret typed into it (empty keeps the keychain entry).
+    fn read_form(&self, cx: &Context<Self>) -> (Connection, String) {
         let text =
             |s: &Entity<InputState>, cx: &Context<Self>| s.read(cx).value().trim().to_string();
         let conn = Connection {
@@ -156,8 +168,79 @@ impl ConnectPanel {
             // Anything that is not a whole number of seconds keeps the default.
             timeout_secs: text(&self.timeout, cx).parse().unwrap_or(0),
         };
-        let typed = self.secret.read(cx).value().to_string();
+        (conn, self.secret.read(cx).value().to_string())
+    }
+
+    fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (conn, typed) = self.read_form(cx);
         self.start(conn, typed, false, window, cx);
+    }
+
+    /// Checks that the cluster answers with the form's settings; nothing is saved or switched.
+    fn test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (conn, typed) = self.read_form(cx);
+        self.busy = true;
+        (self.failure, self.notice) = (None, None);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            // The keychain may block on the platform service, so it stays off the UI thread.
+            let built = cx
+                .background_spawn(async move { probe(&conn, &typed) })
+                .await;
+            let outcome = match built {
+                Ok(client) => client.version().await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(v) => {
+                        this.notice = Some(
+                            format!("Connection works. Elasticsearch {}.{}.{}", v[0], v[1], v[2])
+                                .into(),
+                        )
+                    }
+                    Err(e) => this.failure = Some(format!("Could not connect. {e}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Writes the form to the saved list and the keychain without connecting.
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (conn, typed) = self.read_form(cx);
+        (self.failure, self.notice) = (None, None);
+        if conn.name.is_empty() {
+            self.failure = Some("Name is required.".into());
+            cx.notify();
+            return;
+        }
+        let path = self.path.clone();
+        let (old, name) = (self.editing.clone(), conn.name.clone());
+        self.busy = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let done = cx
+                .background_spawn(async move { persist(&path, &conn, &typed, old.as_deref()) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match done {
+                    Ok(saved) => {
+                        this.saved = saved;
+                        this.editing = Some(name);
+                        this.notice = Some("Saved.".into());
+                    }
+                    Err(e) => this.failure = Some(format!("Could not save. {e}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Connects in the background. `quiet` means no dialog is open, so a failure is pushed as a
@@ -172,7 +255,7 @@ impl ConnectPanel {
     ) {
         let path = self.path.clone();
         self.busy = true;
-        self.failure = None;
+        (self.failure, self.notice) = (None, None);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             // The keychain may block on the platform service, so it stays off the UI thread.
@@ -234,22 +317,33 @@ impl ConnectPanel {
                 .description("Its saved password, API key or token is removed from the keychain.")
                 .ok_text("Delete connection")
                 .show_cancel(true)
-                .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.delete(name.clone(), cx));
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.delete(name.clone(), window, cx));
                     true
                 })
         });
     }
 
-    fn delete(&mut self, name: String, cx: &mut Context<Self>) {
+    /// Removes the connection, then shows the next saved one (or a blank form) so the dialog visibly
+    /// changes; a failure is also pushed as a notification, since the form's own message is easy to miss.
+    fn delete(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let path = self.path.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let n = name.clone();
             let done = cx.background_spawn(async move { remove(&path, &n) }).await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 match done {
-                    Ok(saved) => this.saved = saved,
-                    Err(e) => this.failure = Some(format!("Could not delete. {e}").into()),
+                    Ok(saved) => {
+                        this.saved = saved;
+                        let next = this.saved.first().cloned().unwrap_or_default();
+                        this.fill(&next, window, cx);
+                        window.push_notification(format!("Deleted connection {name}."), cx);
+                    }
+                    Err(e) => {
+                        let msg = format!("Could not delete. {e}");
+                        window.push_notification(msg.clone(), cx);
+                        this.failure = Some(msg.into());
+                    }
                 }
                 cx.notify();
             })
@@ -413,6 +507,14 @@ impl ConnectPanel {
                     .text_color(cx.theme().danger)
                     .child(f)
             }))
+            .children(self.notice.clone().map(|n| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(cx.theme().success)
+                    .child(n)
+            }))
             .child(div().flex_1())
             .children(self.is_saved(cx).then(|| {
                 Button::new("delete")
@@ -420,6 +522,20 @@ impl ConnectPanel {
                     .label("Delete…")
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)))
             }))
+            .child(
+                Button::new("test")
+                    .outline()
+                    .label("Test")
+                    .disabled(self.busy)
+                    .on_click(cx.listener(|this, _, window, cx| this.test(window, cx))),
+            )
+            .child(
+                Button::new("save")
+                    .outline()
+                    .label("Save")
+                    .disabled(self.busy)
+                    .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+            )
             .child(
                 Button::new("connect")
                     .primary()
@@ -458,6 +574,59 @@ fn prepare(
     saved.insert(0, conn.clone());
     connection::save(path, &saved).map_err(show)?;
     Ok((client, saved))
+}
+
+/// Builds a client from the form without touching the keychain or the saved list; a typed secret
+/// wins over the stored one.
+fn probe(conn: &Connection, typed: &str) -> Result<Client, String> {
+    let show = |e: es_client::Error| e.to_string();
+    let secret = if conn.auth == AuthKind::None {
+        None
+    } else if !typed.is_empty() {
+        Some(typed.to_string())
+    } else {
+        Keychain.get(&conn.name).map_err(show)?
+    };
+    Client::new(conn.config(secret).map_err(show)?).map_err(show)
+}
+
+/// Stores the typed secret (if any) and writes the connection in place of `old`, the entry the form
+/// was filled from; a new name moves the keychain secret along. Without `old` it is a new entry.
+fn persist(
+    path: &std::path::Path,
+    conn: &Connection,
+    typed: &str,
+    old: Option<&str>,
+) -> Result<Vec<Connection>, String> {
+    let show = |e: es_client::Error| e.to_string();
+    let mut saved = connection::load(path).map_err(show)?;
+    let old = old.filter(|o| *o != conn.name);
+    if old.is_some() && saved.iter().any(|c| c.name == conn.name) {
+        return Err(format!(
+            "A connection named \"{}\" already exists.",
+            conn.name
+        ));
+    }
+    if conn.auth != AuthKind::None {
+        let secret = match (typed.is_empty(), old) {
+            (false, _) => Some(typed.to_string()),
+            (true, Some(old)) => Keychain.get(old).map_err(show)?,
+            (true, None) => None,
+        };
+        if let Some(secret) = secret {
+            Keychain.set(&conn.name, &secret).map_err(show)?;
+        }
+    }
+    let key = old.unwrap_or(&conn.name);
+    match saved.iter_mut().find(|c| c.name == key) {
+        Some(slot) => *slot = conn.clone(),
+        None => saved.insert(0, conn.clone()),
+    }
+    connection::save(path, &saved).map_err(show)?;
+    if let Some(old) = old {
+        Keychain.delete(old).map_err(show)?;
+    }
+    Ok(saved)
 }
 
 /// Drops `name` from the saved list and the keychain; returns the remaining list.
