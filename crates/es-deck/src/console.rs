@@ -1344,6 +1344,10 @@ impl Render for Console {
         let size = |r: f32| rems(r).to_pixels(rem);
         let sidebar = self.http.is_some() && self.sidebar_open;
         let response = matches!(self.run, Run::Done { .. });
+        // Editor and response start at 4:6 of the width the tree leaves over (minus the side margins).
+        let sidebar_width = size(20.0);
+        let open_tree = if sidebar { sidebar_width } else { px(0.) };
+        let response_width = (window.viewport_size().width - open_tree - size(1.0)) * 0.6;
         let tool = |id: &'static str, icon: IconName, tip: &'static str| {
             Button::new(id).ghost().small().icon(icon).tooltip(tip)
         };
@@ -1479,15 +1483,16 @@ impl Render for Console {
             )
             .child(self.render_titlebar(cx))
             .child(
-                // Panels clip their content and the editors do not wrap, so a narrower panel
+                // The tree keeps its width: a drag on another handle never takes space from it. Panels clip their content and the editors do not wrap, so a narrower panel
                 // hides text instead of reflowing it.
                 div().flex_1().min_h_0().mx_2().mb_2().child(
                     h_resizable("console-split")
                         .child(
                             resizable_panel()
                                 .visible(sidebar)
-                                .size(size(14.0))
-                                .size_range(size(8.0)..size(28.0))
+                                .size(sidebar_width)
+                                .fixed()
+                                .size_range(size(16.0)..size(40.0))
                                 .child(div().size_full().pr_2().child(targets)),
                         )
                         .child(
@@ -1500,7 +1505,7 @@ impl Render for Console {
                         .child(
                             resizable_panel()
                                 .visible(response)
-                                .size(size(36.0))
+                                .size(response_width)
                                 .size_range(size(16.0)..size(120.0))
                                 .child(
                                     div()
