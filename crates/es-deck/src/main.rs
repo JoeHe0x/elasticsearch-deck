@@ -76,8 +76,9 @@ fn main() -> Result<()> {
             };
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 let library = cx.new(|_| library::Library::load(&connections));
+                let draft = library.read(cx).draft();
                 cx.new(|cx| {
-                    console::Console::new("", index, client, library, connections, window, cx)
+                    console::Console::new(&draft, index, client, library, connections, window, cx)
                 })
             });
             if let Err(e) = opened {

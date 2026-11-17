@@ -154,6 +154,13 @@ impl ConnectPanel {
         self.start(conn, String::new(), true, window, cx);
     }
 
+    /// Reconnects to the last used connection (the first saved one); a no-op with none saved.
+    pub fn reconnect_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = self.saved.first().map(|c| c.name.clone()) {
+            self.switch_to(&name, window, cx);
+        }
+    }
+
     /// The form as a connection, plus the secret typed into it (empty keeps the keychain entry).
     fn read_form(&self, cx: &Context<Self>) -> (Connection, String) {
         let text =

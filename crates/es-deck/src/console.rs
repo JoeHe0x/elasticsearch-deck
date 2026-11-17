@@ -295,6 +295,8 @@ impl Console {
             this.connected(done, cx)
         })
         .detach();
+        // The editor's draft is restored on startup, so the connection it ran against is too.
+        panel.update(cx, |p, cx| p.reconnect_last(window, cx));
         Self {
             editor,
             panel,
@@ -363,10 +365,11 @@ impl Console {
         self.lint = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(LINT_DELAY).await;
             let Ok((text, client)) = this.update(cx, |this, cx| {
-                (
-                    this.editor.read(cx).value().to_string(),
-                    this.client.clone(),
-                )
+                let text = this.editor.read(cx).value().to_string();
+                // This task is replaced by every edit, so the draft is saved once typing pauses.
+                this.library
+                    .update(cx, |library, cx| library.save_draft(text.clone(), cx));
+                (text, this.client.clone())
             }) else {
                 return;
             };

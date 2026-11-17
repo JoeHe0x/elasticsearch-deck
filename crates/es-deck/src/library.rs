@@ -12,6 +12,7 @@ pub struct Library {
     saved_path: PathBuf,
     history: Vec<Entry>,
     history_path: PathBuf,
+    draft_path: PathBuf,
 }
 
 /// What changed, so a tab refreshes only the list that depends on it.
@@ -34,7 +35,23 @@ impl Library {
             history: history::load(&history_path).unwrap_or_default(),
             saved_path,
             history_path,
+            draft_path: dir_file.with_file_name("draft.txt"),
         }
+    }
+
+    /// The editor text left by the previous run, empty when there is none.
+    pub fn draft(&self) -> String {
+        std::fs::read_to_string(&self.draft_path).unwrap_or_default()
+    }
+
+    /// Writes the editor text off the UI thread so the next run can restore it.
+    pub fn save_draft(&self, text: String, cx: &mut Context<Self>) {
+        let path = self.draft_path.clone();
+        // A failed write only loses this session's draft.
+        cx.background_spawn(async move {
+            let _ = std::fs::write(path, text);
+        })
+        .detach();
     }
 
     /// Empty, with files under the temp directory, so a test never reads or writes real ones.
@@ -46,6 +63,7 @@ impl Library {
             saved_path: dir.join("saved.json"),
             history: Vec::new(),
             history_path: dir.join("history.json"),
+            draft_path: dir.join("draft.txt"),
         }
     }
 
