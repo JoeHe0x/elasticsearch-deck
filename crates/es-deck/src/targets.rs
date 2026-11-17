@@ -2,9 +2,12 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, IndexPath, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Context, ParentElement as _, SharedString, Styled as _, Task, Window, div, rems,
+    App, Context, InteractiveElement as _, ParentElement as _, SharedString, Styled as _, Task,
+    Window, div, rems,
 };
 
 use crate::connect::row_id;
@@ -67,12 +70,24 @@ impl Folder {
     }
 }
 
+/// What the right-click menu of a console row asks for.
+#[derive(Debug, Clone, Copy)]
+pub enum ConsoleOp {
+    Rename,
+    Delete,
+}
+
+/// Called with the operation and the console's name; the owner of the tree performs it.
+pub type ConsoleMenu = std::rc::Rc<dyn Fn(ConsoleOp, String, &mut Window, &mut App)>;
+
 /// One entry in a folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub label: String,
     /// What a click puts in the editor.
     pub text: String,
+    /// A closed index: listed, but drawn dimmed.
+    pub closed: bool,
 }
 
 /// The request a click on an index or alias inserts.
@@ -101,6 +116,7 @@ pub struct Targets {
     collapsed: [bool; 7],
     /// The last activated line and when, to tell a double click from two clicks.
     last_click: Option<(usize, std::time::Instant)>,
+    menu: Option<ConsoleMenu>,
 }
 
 impl Default for Targets {
@@ -113,6 +129,7 @@ impl Default for Targets {
             selected: None,
             collapsed: FOLDERS.map(|f| f != Folder::Indices),
             last_click: None,
+            menu: None,
         };
         t.relayout();
         t
@@ -129,6 +146,11 @@ impl Targets {
         self.all[slot] = rows;
         self.refilter();
         true
+    }
+
+    /// Gives the console rows a right-click menu.
+    pub fn set_menu(&mut self, menu: ConsoleMenu) {
+        self.menu = Some(menu);
     }
 
     /// Drops every row, e.g. on disconnect.
@@ -290,15 +312,63 @@ impl ListDelegate for Targets {
                 )
             }
             Line::Item(slot, i) => {
-                let label = self.shown[slot].get(i)?.label.clone();
+                let (label, closed) = {
+                    let r = self.shown[slot].get(i)?;
+                    (r.label.clone(), r.closed)
+                };
                 let id = row_id(&format!("{slot}/{label}"));
-                item(("tree-item", id as usize)).child(
+                let inner = row()
                     // Indented under the folder's icon, past its chevron.
-                    row()
-                        .pl_9()
-                        .child(Icon::new(FOLDERS[slot].icon()).small().text_color(muted))
-                        .child(div().truncate().child(SharedString::from(label))),
-                )
+                    .pl_9()
+                    .child(
+                        Icon::new(if closed {
+                            IconName::EyeOff
+                        } else {
+                            FOLDERS[slot].icon()
+                        })
+                        .small()
+                        .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .when(closed, |d| d.text_color(muted))
+                            .child(SharedString::from(label.clone())),
+                    );
+                let entry = item(("tree-item", id as usize));
+                match (&self.menu, FOLDERS[slot]) {
+                    (Some(menu), Folder::Consoles) if label != es_client::saved::AUTO_CONSOLE => {
+                        let menu = menu.clone();
+                        entry.child(inner.id(("tree-console", id as usize)).context_menu(
+                            move |popup, _, _| {
+                                let (rename, delete) = (menu.clone(), menu.clone());
+                                let (rename_name, delete_name) = (label.clone(), label.clone());
+                                popup
+                                    .item(PopupMenuItem::new("Rename…").on_click(
+                                        move |_, window, cx| {
+                                            rename(
+                                                ConsoleOp::Rename,
+                                                rename_name.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    ))
+                                    .item(PopupMenuItem::new("Delete").on_click(
+                                        move |_, window, cx| {
+                                            delete(
+                                                ConsoleOp::Delete,
+                                                delete_name.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    ))
+                            },
+                        ))
+                    }
+                    _ => entry.child(inner),
+                }
             }
         })
     }
@@ -322,6 +392,7 @@ mod tests {
         Row {
             label: label.into(),
             text: format!("GET {label}"),
+            closed: false,
         }
     }
 

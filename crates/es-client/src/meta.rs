@@ -15,6 +15,7 @@ use crate::{Client, Request};
 struct State {
     names: Vec<String>,
     aliases: Vec<String>,
+    closed: Vec<String>,
     mappings: HashMap<String, Vec<Field>>,
     wanted: HashSet<String>,
     names_at: Option<Instant>,
@@ -40,7 +41,7 @@ impl ClusterMeta {
         };
         let stale = self.lock().names_at.is_none_or(|t| t.elapsed() > NAMES_TTL);
         if stale {
-            let cat = get("_cat/indices?format=json&h=index").await?;
+            let cat = get("_cat/indices?format=json&h=index,status").await?;
             let alias = get("_alias").await?;
             let ok = |r: crate::Response| {
                 if r.status == 200 {
@@ -51,7 +52,9 @@ impl ClusterMeta {
             };
             let (cat, alias) = (ok(cat), ok(alias));
             let (names, aliases) = (parse_names(&cat, &alias), parse_aliases(&alias));
+            let closed = parse_closed(&cat);
             let mut s = self.lock();
+            s.closed = closed;
             s.names = names;
             s.aliases = aliases;
             s.names_at = Some(Instant::now());
@@ -72,6 +75,11 @@ impl ClusterMeta {
         first_err.map_or(Ok(()), Err)
     }
 
+    /// The indices that are closed, from the last name read.
+    pub fn closed(&self) -> Vec<String> {
+        self.lock().closed.clone()
+    }
+
     /// Makes the next refresh re-read index and alias names regardless of age.
     pub fn invalidate(&self) {
         self.lock().names_at = None;
@@ -80,6 +88,15 @@ impl ClusterMeta {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// From `GET _cat/indices?format=json&h=index,status`: the names whose status is `close`.
+fn parse_closed(cat: &str) -> Vec<String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(cat).unwrap_or_default();
+    rows.iter()
+        .filter(|r| r["status"] == "close")
+        .filter_map(|r| r["index"].as_str().map(String::from))
+        .collect()
 }
 
 /// Only plain index expressions are fetched, so a typed path can never smuggle in other segments.
@@ -114,6 +131,13 @@ impl Fields for ClusterMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_indices_are_those_with_status_close() {
+        let cat = r#"[{"index":"a","status":"open"},{"index":"b","status":"close"}]"#;
+        assert_eq!(parse_closed(cat), ["b"]);
+        assert!(parse_closed("nope").is_empty());
+    }
     use crate::Config;
     use httpmock::prelude::*;
 

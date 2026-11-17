@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI programs; without this, Windows opens a console window behind the app.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod assets;
 mod completion;
 mod connect;
@@ -7,6 +10,7 @@ mod hits_table;
 mod library;
 mod lsp_client;
 mod paint;
+mod schema_source;
 mod targets;
 
 use anyhow::{Context as _, Result};
@@ -15,34 +19,19 @@ use gpui_kit::component::{GlobalState, TitleBar};
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 
 fn main() -> Result<()> {
-    // The index comes from `es-deck-schema`. Without an argument, look next to the working directory,
-    // the executable, then the user config directory; the version always comes from the connected cluster.
     let config = dirs::config_dir()
         .context("no user config directory")?
         .join("elasticsearch-deck");
-    let path = match std::env::args().nth(1) {
-        Some(p) => std::path::PathBuf::from(p),
-        None => [
-            Some(std::path::PathBuf::from("index.json")),
-            std::env::current_exe()
-                .ok()
-                .and_then(|e| e.parent().map(|d| d.join("index.json"))),
-            Some(config.join("index.json")),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|p| p.is_file())
-        .context(
-            "no index.json found; generate it with \
-             `cargo run -p es-deck-schema -- <schema.json> index.json` \
-             (schema.json is in the elasticsearch-specification repo, output/schema/) \
-             and put it in the working directory or the app config directory",
-        )?,
+    // The index for the connected version is downloaded on connect; this one is used until then and
+    // when that fails. An argument replaces it, for debugging.
+    let index: Index = match std::env::args().nth(1) {
+        Some(path) => serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("cannot read the index {path:?}"))?,
+        )
+        .with_context(|| format!("parsing {path:?}"))?,
+        None => serde_json::from_slice(include_bytes!("../assets/index-8.19.json"))
+            .context("parsing the bundled index")?,
     };
-    let index: Index = serde_json::from_slice(
-        &std::fs::read(&path).with_context(|| format!("cannot read the index {path:?}"))?,
-    )
-    .with_context(|| format!("parsing {path:?}"))?;
     // Optional override for debugging; connecting to a cluster replaces it with the cluster's version.
     let version = match std::env::args().nth(2) {
         Some(v) => Some(parse_version(&v).with_context(|| format!("bad version {v:?}"))?),

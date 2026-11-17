@@ -291,3 +291,10 @@ Recommendation: option 1. It is the smallest change that gets the result, and it
 Open: the type column depends on the LSP filling `detail` (`es-dsl-lsp` passes `Candidate`'s detail through; not checked that every kind has one). Not verified: none of the above was run.
 
 Decision: the user rejected the vendored fork (option 1) and chose to stay on the stock kit, so the popup keeps no icons and no footer; only the label highlighter is customised. Revisit if the kit adds an icon slot (option 3).
+
+## Per-version index download
+
+- On connect, `es-deck` picks the spec branch for the cluster's `major.minor`, then up to six lower minors of the same major (the spec has no 7.18 or 7.19 branch; 7.17 is the last 7.x). The converted index is cached as `index-<branch>.json` in the config directory.
+- Checked against raw.githubusercontent.com: a 7.19.0 cluster tried 7.19 and 7.18 (HTTP 404), downloaded 7.17 and cached it, about 10 s in total.
+- `crates/es-deck/assets/index-8.19.json` is bundled and used until the download finishes or when it fails. Regenerate it with `es-deck-schema` from the 8.19 branch's `schema.json`.
+- The download URL template can be replaced with `schema-url.txt` in the config directory (`{branch}` is substituted). Not checked against a real mirror.

@@ -1,5 +1,6 @@
 //! The request editor: a GPUI Kit code editor whose completions come from the in-process LSP.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -45,7 +46,8 @@ use crate::hits_table::HitsTable;
 use crate::library::{Changed, Library};
 use crate::lsp_client::LspClient;
 use crate::paint::Paint;
-use crate::targets::{Folder, Row, Targets, search_text};
+use crate::schema_source;
+use crate::targets::{ConsoleOp, Folder, Row, Targets, search_text};
 
 /// How often a connected console re-reads cluster metadata for targets it has not seen yet.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
@@ -153,6 +155,17 @@ struct TreePalette {
     guide: Hsla,
 }
 
+/// The response area of a tab that is not shown, kept so switching back finds it as it was.
+struct Pane {
+    run: Run,
+    hits: Option<Entity<TableState<HitsTable>>>,
+    tree: Option<Entity<TreeState>>,
+    full_body: Option<String>,
+    view: View,
+    /// The text of the response editor.
+    shown: String,
+}
+
 /// What the toolbar shows about the cluster the console is talking to.
 struct Summary {
     name: SharedString,
@@ -204,8 +217,14 @@ pub struct Console {
     refresh: Option<Task<()>>,
     /// A pending check; replaced (so cancelled) by the next edit.
     lint: Option<Task<()>>,
+    /// The config directory, where downloaded indexes are cached.
+    config_dir: PathBuf,
+    /// Fetching the index of the connected version; replaced, so cancelled, by the next connection.
+    schema_load: Option<Task<()>>,
     /// The console the editor shows, which the autosave writes to.
     active: String,
+    /// The response area of every tab but the active one, by console name.
+    panes: HashMap<String, Pane>,
     /// The consoles shown as tabs above the editor, in opening order; `active` is one of them.
     tabs: Vec<String>,
     paint: Paint,
@@ -263,6 +282,16 @@ impl Console {
                 .soft_wrap(false)
         });
         let targets = cx.new(|cx| ListState::new(Targets::default(), window, cx));
+        let owner = cx.weak_entity();
+        targets.update(cx, |list, _| {
+            list.delegate_mut()
+                .set_menu(std::rc::Rc::new(move |op, name, window, cx| {
+                    let _ = owner.update(cx, |this, cx| match op {
+                        ConsoleOp::Rename => this.rename_console(name, window, cx),
+                        ConsoleOp::Delete => this.delete_console(name, cx),
+                    });
+                }));
+        });
         cx.subscribe(&targets, |this, list, ev: &ListEvent, cx| {
             if let ListEvent::Confirm(ix) = ev {
                 let mut double = false;
@@ -313,6 +342,7 @@ impl Console {
             }
         })
         .detach();
+        let config_dir = connections.parent().map(PathBuf::from).unwrap_or_default();
         let panel = cx.new(|cx| ConnectPanel::new(connections, window, cx));
         cx.subscribe(&panel, |this, _, done: &Connected, cx| {
             this.connected(done, cx)
@@ -348,7 +378,10 @@ impl Console {
             meta: None,
             refresh: None,
             lint: None,
+            config_dir,
+            schema_load: None,
             active: saved::AUTO_CONSOLE.into(),
+            panes: HashMap::new(),
             tabs: vec![saved::AUTO_CONSOLE.into()],
             paint,
             menu_bar: AppMenuBar::new(cx),
@@ -639,14 +672,56 @@ impl Console {
         if !self.tabs.contains(&name) {
             self.tabs.push(name.clone());
         }
-        self.active = name;
-        let _ = window.update(cx, |_, window, cx| {
-            editor.update(cx, |state, cx| {
-                state.set_value(text, window, cx);
-                state.focus(window, cx);
+        // A check still waiting would save the old text under the new name.
+        self.lint = None;
+        let leaving = std::mem::replace(&mut self.active, name.clone());
+        let shown = (leaving != name).then(|| self.swap_pane(leaving, &name, cx));
+        let response = self.response.clone();
+        // Opened from a list click, the window is busy with that event and refuses a direct update,
+        // which would leave the old text in the editor; a task runs once the event is done.
+        cx.spawn(async move |this, cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                if let Some(shown) = shown {
+                    response.update(cx, |state, cx| state.set_value(shown, window, cx));
+                }
+                editor.update(cx, |state, cx| {
+                    state.set_value(text, window, cx);
+                    state.focus(window, cx);
+                });
             });
-        });
-        self.lint(cx);
+            let _ = this.update(cx, |this, cx| this.lint(cx));
+        })
+        .detach();
+    }
+
+    /// Parks the response area under `leaving` and brings back `entering`'s, or an empty one.
+    /// Returns the text the response editor must show. A request still in flight is cancelled:
+    /// its answer would otherwise land in the wrong tab.
+    fn swap_pane(&mut self, leaving: String, entering: &str, cx: &mut Context<Self>) -> String {
+        self.sending = None;
+        let run = match std::mem::replace(&mut self.run, Run::Idle) {
+            Run::Sending => Run::Idle,
+            run => run,
+        };
+        let pane = Pane {
+            run,
+            hits: self.hits.take(),
+            tree: self.tree.take(),
+            full_body: self.full_body.take(),
+            view: self.view,
+            shown: self.response.read(cx).value().to_string(),
+        };
+        // A deleted console leaves nothing behind.
+        if !leaving.is_empty() {
+            self.panes.insert(leaving, pane);
+        }
+        let Some(next) = self.panes.remove(entering) else {
+            self.view = View::Json;
+            return String::new();
+        };
+        (self.run, self.hits, self.tree) = (next.run, next.hits, next.tree);
+        (self.full_body, self.view) = (next.full_body, next.view);
+        next.shown
     }
 
     /// Opens the console named after an index or alias: created when new, otherwise the search
@@ -736,7 +811,7 @@ impl Console {
                 };
                 let (rename, delete) = (console.clone(), console.clone());
                 let (rename_name, delete_name) = (name.clone(), name.clone());
-                tab.children(closable.then(|| {
+                let tab = tab.children(closable.then(|| {
                     div()
                         .id(("close-tab", ix))
                         .size_4()
@@ -751,8 +826,12 @@ impl Console {
                             this.close_tab(ix, cx);
                         }))
                         .child(Icon::new(IconName::Close).size_3())
-                }))
-                .context_menu(move |menu, _, _| {
+                }));
+                // The default console can be neither renamed nor deleted, so it has no menu.
+                if name == saved::AUTO_CONSOLE {
+                    return tab.into_any_element();
+                }
+                tab.context_menu(move |menu, _, _| {
                     let (rename, rename_name) = (rename.clone(), rename_name.clone());
                     let (delete, delete_name) = (delete.clone(), delete_name.clone());
                     menu.item(
@@ -766,6 +845,7 @@ impl Console {
                         delete.update(cx, |this, cx| this.delete_console(name, cx))
                     }))
                 })
+                .into_any_element()
             }))
     }
 
@@ -857,6 +937,7 @@ impl Console {
                 .map(|s| Row {
                     label: s.name.clone(),
                     text: s.text.clone(),
+                    closed: false,
                 })
                 .collect()
         };
@@ -894,17 +975,19 @@ impl Console {
 
     /// Removes the console called `name`, closing its tab.
     fn delete_console(&mut self, name: String, cx: &mut Context<Self>) {
-        let conn = self.connection_name();
-        let Some(text) = self.library.read(cx).console(&conn, &name) else {
+        // The default console always exists.
+        if name == saved::AUTO_CONSOLE {
             return;
-        };
+        }
+        let conn = self.connection_name();
+        self.panes.remove(&name);
         let was_active = name == self.active;
         // Without this the autosave would write the open console straight back.
         if was_active {
             self.active.clear();
         }
         self.library.update(cx, |library, cx| {
-            library.remove_saved(&conn, Kind::Console, &text, cx)
+            library.remove_saved(&conn, Kind::Console, &name, cx)
         });
         let Some(ix) = self.tabs.iter().position(|t| *t == name) else {
             return;
@@ -923,16 +1006,16 @@ impl Console {
 
     /// Asks for a new name for the console called `old`.
     fn rename_console(&mut self, old: String, window: &mut Window, cx: &mut Context<Self>) {
-        let conn = self.connection_name();
-        let Some(text) = self.library.read(cx).console(&conn, &old) else {
+        // The default console keeps its name, as the autosave and the connection's startup look for it.
+        if old == saved::AUTO_CONSOLE {
             return;
-        };
+        }
         let input = cx.new(|cx| InputState::new(window, cx));
         input.update(cx, |s, cx| s.set_value(old.clone(), window, cx));
         let console = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let (input, console) = (input.clone(), console.clone());
-            let (old, text) = (old.clone(), text.clone());
+            let old = old.clone();
             dialog.title("Rename").child(
                 div()
                     .flex()
@@ -950,22 +1033,23 @@ impl Console {
                                     move |_, window, cx| {
                                         let new = input.read(cx).value().trim().to_string();
                                         let new: String = new.chars().take(60).collect();
-                                        let (console, old, text) =
-                                            (console.clone(), old.clone(), text.clone());
+                                        let (console, old) = (console.clone(), old.clone());
                                         console.update(cx, |this, cx| {
                                             let conn = this.connection_name();
                                             let done = this.library.update(cx, |library, cx| {
                                                 library.rename_saved(
                                                     &conn,
                                                     Kind::Console,
-                                                    &text,
+                                                    &old,
                                                     &new,
                                                     cx,
-                                                );
-                                                library.console(&conn, &new).is_some()
+                                                )
                                             });
                                             // Tabs and the autosave follow the console by name.
                                             if done {
+                                                if let Some(pane) = this.panes.remove(&old) {
+                                                    this.panes.insert(new.clone(), pane);
+                                                }
                                                 for t in
                                                     this.tabs.iter_mut().chain([&mut this.active])
                                                 {
@@ -1075,6 +1159,7 @@ impl Console {
                         .map(|i| Row {
                             label: i.label,
                             text: i.request,
+                            closed: false,
                         })
                         .collect()
                 };
@@ -1096,6 +1181,22 @@ impl Console {
         self.load_catalog(cx);
     }
 
+    /// Switches completion to `index`, the one that matches the connected version.
+    fn use_index(
+        &mut self,
+        index: Index,
+        version: es_dsl_core::Version,
+        fields: es_client::ClusterMeta,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(client) = LspClient::start(index, Some(version), fields) else {
+            return;
+        };
+        self.client = client.clone();
+        self.editor.update(cx, |state, _| install(state, &client));
+        self.lint(cx);
+    }
+
     /// Restarts completion against the cluster that just answered, and keeps its metadata fresh.
     fn connected(&mut self, done: &Connected, cx: &mut Context<Self>) {
         let started = LspClient::start(self.index.clone(), Some(done.version), done.meta.clone());
@@ -1108,6 +1209,7 @@ impl Console {
         self.client = client.clone();
         self.http = Some(done.client.clone());
         self.online = true;
+        self.panes.clear();
         self.refresh_history(cx);
         self.refresh_saved(cx);
         self.load_catalog(cx);
@@ -1122,6 +1224,12 @@ impl Console {
         }
         self.editor.update(cx, |state, _| install(state, &client));
         self.lint(cx);
+        let (dir, version, fields) = (self.config_dir.clone(), done.version, done.meta.clone());
+        self.schema_load = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx.background_spawn(schema_source::load(dir, version)).await;
+            let Some(index) = loaded else { return };
+            let _ = this.update(cx, |this, cx| this.use_index(index, version, fields, cx));
+        }));
         let (http, meta) = (done.client.clone(), done.meta.clone());
         self.meta = Some(meta.clone());
         self.refresh = Some(cx.spawn(async move |this, cx| {
@@ -1131,6 +1239,7 @@ impl Console {
                 let reached = meta.refresh(&http).await.is_ok();
                 let names = es_dsl_core::Fields::names(&meta);
                 let aliases = es_dsl_core::Fields::aliases(&meta);
+                let closed = meta.closed();
                 let indices = names
                     .into_iter()
                     .filter(|n| aliases.binary_search(n).is_err());
@@ -1139,6 +1248,7 @@ impl Console {
                         .into_iter()
                         .map(|n| Row {
                             text: search_text(&n),
+                            closed: closed.contains(&n),
                             label: n,
                         })
                         .collect()
@@ -1551,11 +1661,9 @@ impl Render for Console {
         let rem = window.rem_size();
         let size = |r: f32| rems(r).to_pixels(rem);
         let sidebar = self.http.is_some() && self.sidebar_open;
+        // Both halves are always laid out: the panel library keeps the editor's full width when a hidden panel appears later.
         let response = matches!(self.run, Run::Done { .. });
-        // Editor and response start at 4:6 of the width the tree leaves over (minus the side margins).
         let sidebar_width = size(20.0);
-        let open_tree = if sidebar { sidebar_width } else { px(0.) };
-        let response_width = (window.viewport_size().width - open_tree - size(1.0)) * 0.6;
         let tool = |id: &'static str, icon: IconName, tip: &'static str| {
             Button::new(id).ghost().small().icon(icon).tooltip(tip)
         };
@@ -1681,31 +1789,39 @@ impl Render for Console {
                                 .child(div().size_full().pr_0p5().child(targets)),
                         )
                         .child(
+                            // The tabs belong to the editor and the response together, so they sit above both.
                             resizable_panel().child(
-                                card()
-                                    .p_1p5()
+                                div()
+                                    .size_full()
                                     .flex()
                                     .flex_col()
-                                    .gap_1()
                                     .child(self.render_tabs(cx))
                                     .child(
                                         div().flex_1().min_h_0().child(
-                                            Editor::new(&self.editor).bordered(false).h_full(),
+                                            h_resizable("editor-split")
+                                                .child(
+                                                    resizable_panel().child(
+                                                        card().p_1p5().child(
+                                                            Editor::new(&self.editor)
+                                                                .bordered(false)
+                                                                .h_full(),
+                                                        ),
+                                                    ),
+                                                )
+                                                .child(
+                                                    resizable_panel()
+                                                        .size_range(size(16.0)..size(120.0))
+                                                        .child(div().size_full().pl_0p5().child(
+                                                            card().p_2().children(
+                                                                response.then(|| {
+                                                                    self.render_response(cx)
+                                                                }),
+                                                            ),
+                                                        )),
+                                                ),
                                         ),
                                     ),
                             ),
-                        )
-                        .child(
-                            resizable_panel()
-                                .visible(response)
-                                .size(response_width)
-                                .size_range(size(16.0)..size(120.0))
-                                .child(
-                                    div()
-                                        .size_full()
-                                        .pl_0p5()
-                                        .child(card().p_2().child(self.render_response(cx))),
-                                ),
                         ),
                 ),
             )
@@ -1787,6 +1903,63 @@ mod tests {
         let value = cx.update(|cx| editor.read(cx).value().to_string());
         // The typed `"q` is replaced by the whole quoted key.
         assert_eq!(value, "POST idx/_search\n{\n  \"query\": ");
+    }
+
+    /// Opening an index's console from inside a window update, as a list click does, replaces the editor text.
+    #[gpui_kit::test]
+    fn opening_a_new_console_shows_only_its_own_request(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let client = LspClient::start(sample_index(), None, es_dsl_core::NoFields).unwrap();
+        let (window, console) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    let library = cx.new(|_| Library::blank());
+                    cx.new(|cx| {
+                        Console::new(
+                            "",
+                            sample_index(),
+                            client,
+                            library,
+                            PathBuf::from("unused.json"),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c".into(),
+                    version: "".into(),
+                });
+            });
+            editor.update(cx, |state, cx| {
+                state.set_value("GET old/_search", window, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            console.update(cx, |this, cx| this.open_named("idx".into(), cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let value = cx.update(|cx| editor.read(cx).value().to_string());
+        assert_eq!(value, search_text("idx"));
+        // Let the autosave fire: the console that was left must keep its own text.
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let library = cx.update(|cx| console.read(cx).library.clone());
+        let (left, new) = cx.update(|cx| {
+            let l = library.read(cx);
+            (l.console("c", saved::AUTO_CONSOLE), l.console("c", "idx"))
+        });
+        assert_eq!(left.as_deref(), Some("GET old/_search"));
+        assert_eq!(new, Some(search_text("idx")));
     }
 
     /// Real editor and server: an unknown key is underlined once the typing pause has passed.

@@ -94,19 +94,31 @@ pub fn set_console(
     }
 }
 
-/// Renames the saved item with this connection, kind and text. False for an empty name or no match.
-pub fn rename(list: &mut [Saved], connection: &str, kind: Kind, text: &str, name: &str) -> bool {
-    let name = name.trim();
+/// Renames the item called `old`. False for an empty name, a name already taken, or no match.
+pub fn rename(list: &mut [Saved], connection: &str, kind: Kind, old: &str, name: &str) -> bool {
+    let name: String = name.trim().chars().take(60).collect();
+    let key = |s: &Saved| (s.connection.clone(), s.kind);
+    let taken = list
+        .iter()
+        .any(|s| key(s) == (connection.to_string(), kind) && s.name == name);
     let found = list
         .iter_mut()
-        .find(|s| (s.connection.as_str(), s.kind, s.text.as_str()) == (connection, kind, text));
+        .find(|s| key(s) == (connection.to_string(), kind) && s.name == old);
     match found {
-        Some(s) if !name.is_empty() => {
-            s.name = name.chars().take(60).collect();
+        Some(s) if !name.is_empty() && !taken => {
+            s.name = name;
             true
         }
         _ => false,
     }
+}
+
+/// Removes the one item called `name`, not others that happen to hold the same text.
+pub fn remove(list: &mut Vec<Saved>, connection: &str, kind: Kind, name: &str) -> bool {
+    let at = list
+        .iter()
+        .position(|s| (s.connection.as_str(), s.kind, s.name.as_str()) == (connection, kind, name));
+    at.map(|i| list.remove(i)).is_some()
 }
 
 #[cfg(test)]
@@ -150,20 +162,8 @@ mod tests {
             " nodes "
         ));
         assert_eq!(list[0].name, "nodes");
-        assert!(!rename(
-            &mut list,
-            "c",
-            Kind::Request,
-            "GET _cat/nodes",
-            " "
-        ));
-        assert!(!rename(
-            &mut list,
-            "x",
-            Kind::Request,
-            "GET _cat/nodes",
-            "n"
-        ));
+        assert!(!rename(&mut list, "c", Kind::Request, "nodes", " "));
+        assert!(!rename(&mut list, "x", Kind::Request, "nodes", "n"));
         assert_eq!(name_of("\n  GET a/_search  \n{}"), "GET a/_search");
     }
 
@@ -188,5 +188,22 @@ mod tests {
         assert!(set_console(&mut list, "c", "users", "GET users", 5));
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].text, "GET b");
+    }
+
+    #[test]
+    fn remove_and_rename_act_on_one_item_even_when_texts_match() {
+        let mut list = Vec::new();
+        assert!(set_console(&mut list, "c", "a", "GET x", 1));
+        assert!(set_console(&mut list, "c", "b", "GET x", 1));
+        assert!(
+            !rename(&mut list, "c", Kind::Console, "a", "b"),
+            "name taken"
+        );
+        assert!(rename(&mut list, "c", Kind::Console, "b", "z"));
+        assert_eq!(list[1].name, "z");
+        assert!(remove(&mut list, "c", Kind::Console, "a"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "z");
+        assert!(!remove(&mut list, "c", Kind::Console, "a"));
     }
 }

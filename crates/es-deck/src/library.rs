@@ -120,26 +120,27 @@ impl Library {
         &mut self,
         connection: &str,
         kind: Kind,
-        text: &str,
+        name: &str,
         cx: &mut Context<Self>,
     ) {
-        self.saved.retain(|s| {
-            (s.connection.as_str(), s.kind, s.text.as_str()) != (connection, kind, text)
-        });
-        self.persist_saved(cx);
+        if saved::remove(&mut self.saved, connection, kind, name) {
+            self.persist_saved(cx);
+        }
     }
 
     pub fn rename_saved(
         &mut self,
         connection: &str,
         kind: Kind,
-        text: &str,
+        old: &str,
         name: &str,
         cx: &mut Context<Self>,
-    ) {
-        if saved::rename(&mut self.saved, connection, kind, text, name) {
+    ) -> bool {
+        let renamed = saved::rename(&mut self.saved, connection, kind, old, name);
+        if renamed {
             self.persist_saved(cx);
         }
+        renamed
     }
 
     pub fn record(&mut self, entry: Entry, cx: &mut Context<Self>) {

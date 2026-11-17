@@ -1805,6 +1805,7 @@ dependencies = [
  "dirs 6.0.0",
  "embed-resource",
  "es-client",
+ "es-deck-schema",
  "es-dsl-core",
  "es-dsl-lsp",
  "gpui-kit",
