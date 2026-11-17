@@ -16,20 +16,31 @@
 //!
 //! `has:` labels must all be offered, `lacks:` labels must not be. `none:` expects no candidates.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use es_dsl_core::candidates_with;
 use es_dsl_core::{Field, Fields, parse_version};
 
 struct Mapping;
 impl Fields for Mapping {
-    fn fields(&self, _target: &str) -> Vec<Field> {
-        ["title", "price", "@timestamp", "user.name"]
-            .map(|n| Field {
-                name: n.into(),
-                ty: "keyword".into(),
-            })
-            .into()
+    fn fields(&self, _target: &str) -> Arc<[Field]> {
+        let field = |name: &str, ty: &str, nested: bool| Field {
+            name: name.into(),
+            ty: ty.into(),
+            nested,
+        };
+        Arc::from([
+            field("title", "text", false),
+            field("price", "double", false),
+            field("@timestamp", "date", false),
+            field("user.name", "keyword", false),
+            field("user", "object", false),
+            field("tags", "nested", false),
+            field("tags.name", "keyword", true),
+            field("loc", "geo_point", false),
+            field("busy", "boolean", false),
+            field("notes", "flattened", false),
+        ])
     }
 }
 

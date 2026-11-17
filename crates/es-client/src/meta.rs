@@ -8,15 +8,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use es_dsl_core::{Field, Fields, parse_aliases, parse_mapping, parse_names};
+use tokio::sync::Notify;
 
 use crate::{Client, Request};
+
+/// A cached mapping and when it was read. `at` is `None` after [`ClusterMeta::invalidate`]: the
+/// fields are still served, so completion keeps working while they are re-read.
+struct Mapping {
+    fields: Arc<[Field]>,
+    at: Option<Instant>,
+}
 
 #[derive(Default)]
 struct State {
     names: Vec<String>,
     aliases: Vec<String>,
     closed: Vec<String>,
-    mappings: HashMap<String, Vec<Field>>,
+    mappings: HashMap<String, Mapping>,
     wanted: HashSet<String>,
     names_at: Option<Instant>,
 }
@@ -24,9 +32,18 @@ struct State {
 /// Index and alias names are re-read at most this often.
 const NAMES_TTL: Duration = Duration::from_secs(30);
 
+/// Mappings change much less often than names. A cached mapping older than this is still served,
+/// but a completion that uses it also asks for a background re-read.
+const MAPPING_TTL: Duration = Duration::from_secs(60);
+
 /// Shared cache; clones see the same data.
 #[derive(Clone, Default)]
-pub struct ClusterMeta(Arc<Mutex<State>>);
+pub struct ClusterMeta {
+    state: Arc<Mutex<State>>,
+    /// Wakes the refresh loop when a completion asked for a mapping that is missing or stale, so
+    /// the first request against a new target does not wait for the next periodic tick.
+    wake: Arc<Notify>,
+}
 
 impl ClusterMeta {
     /// Reloads the names and fetches the mapping of every target requested since the last refresh.
@@ -64,7 +81,11 @@ impl ClusterMeta {
         for target in wanted {
             match get(&format!("{target}/_mapping")).await {
                 Ok(r) if r.status == 200 => {
-                    self.lock().mappings.insert(target, parse_mapping(&r.body));
+                    let mapping = Mapping {
+                        fields: Arc::from(parse_mapping(&r.body)),
+                        at: Some(Instant::now()),
+                    };
+                    self.lock().mappings.insert(target, mapping);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -75,18 +96,34 @@ impl ClusterMeta {
         first_err.map_or(Ok(()), Err)
     }
 
+    /// Resolves when completion asked for a mapping that is missing or stale. The owner should call
+    /// [`ClusterMeta::refresh`] when this returns instead of waiting for its periodic tick.
+    pub async fn wanted(&self) {
+        self.wake.notified().await;
+    }
+
     /// The indices that are closed, from the last name read.
     pub fn closed(&self) -> Vec<String> {
         self.lock().closed.clone()
     }
 
-    /// Makes the next refresh re-read index and alias names regardless of age.
+    /// Makes the next refresh re-read index and alias names and re-fetch every mapping, while
+    /// keeping the cached mappings usable until the new ones arrive.
     pub fn invalidate(&self) {
-        self.lock().names_at = None;
+        let mut s = self.lock();
+        s.names_at = None;
+        for mapping in s.mappings.values_mut() {
+            mapping.at = None;
+        }
+    }
+
+    /// Records `target` for the next refresh; true when it was not already recorded.
+    fn request(&self, s: &mut State, target: &str) -> bool {
+        fetchable(target) && s.wanted.insert(target.into())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -108,15 +145,28 @@ fn fetchable(target: &str) -> bool {
 }
 
 impl Fields for ClusterMeta {
-    fn fields(&self, target: &str) -> Vec<Field> {
-        let mut s = self.lock();
-        if let Some(f) = s.mappings.get(target) {
-            return f.clone();
+    fn fields(&self, target: &str) -> Arc<[Field]> {
+        let (fields, wake) = {
+            let mut s = self.lock();
+            match s.mappings.get(target) {
+                Some(mapping) => {
+                    let fields = mapping.fields.clone();
+                    let fresh = mapping.at.is_some_and(|at| at.elapsed() <= MAPPING_TTL);
+                    let wake = if fresh {
+                        false
+                    } else {
+                        self.request(&mut s, target)
+                    };
+                    (fields, wake)
+                }
+                None => (Arc::from([]), self.request(&mut s, target)),
+            }
+        };
+        // Wake only after the lock is dropped: the loop takes it on its first line.
+        if wake {
+            self.wake.notify_one();
         }
-        if fetchable(target) {
-            s.wanted.insert(target.into());
-        }
-        Vec::new()
+        fields
     }
 
     fn names(&self) -> Vec<String> {
@@ -141,9 +191,7 @@ mod tests {
     use crate::Config;
     use httpmock::prelude::*;
 
-    #[tokio::test]
-    async fn fills_names_and_mappings_after_a_miss() {
-        let server = MockServer::start_async().await;
+    fn names_mocks(server: &MockServer) {
         server.mock(|when, then| {
             when.method(GET).path("/_cat/indices");
             then.status(200).body(r#"[{"index":"logs-1"}]"#);
@@ -153,11 +201,21 @@ mod tests {
             then.status(200)
                 .body(r#"{"logs-1":{"aliases":{"logs":{}}}}"#);
         });
+    }
+
+    fn mapping_mock(server: &MockServer) -> httpmock::Mock<'_> {
         server.mock(|when, then| {
             when.method(GET).path("/logs/_mapping");
             then.status(200)
                 .body(r#"{"logs-1":{"mappings":{"properties":{"msg":{"type":"text"}}}}}"#);
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn fills_names_and_mappings_after_a_miss() {
+        let server = MockServer::start_async().await;
+        names_mocks(&server);
+        mapping_mock(&server);
         let client = Client::new(Config::new(server.base_url())).unwrap();
         let meta = ClusterMeta::default();
 
@@ -170,5 +228,33 @@ mod tests {
         let f = meta.fields("logs");
         assert_eq!((f[0].name.as_str(), f[0].ty.as_str()), ("msg", "text"));
         assert!(!meta.lock().wanted.contains("../x?"));
+    }
+
+    #[tokio::test]
+    async fn a_miss_wakes_the_refresh_loop() {
+        let meta = ClusterMeta::default();
+        assert!(meta.fields("logs").is_empty());
+        // The permission is stored, so the loop's next wait returns without another miss.
+        tokio::time::timeout(Duration::from_millis(100), meta.wanted())
+            .await
+            .expect("a miss must wake the loop even when it was not waiting yet");
+    }
+
+    #[tokio::test]
+    async fn invalidate_keeps_serving_and_refetches() {
+        let server = MockServer::start_async().await;
+        names_mocks(&server);
+        let mapping = mapping_mock(&server);
+        let client = Client::new(Config::new(server.base_url())).unwrap();
+        let meta = ClusterMeta::default();
+        let _ = meta.fields("logs");
+        meta.refresh(&client).await.unwrap();
+        assert_eq!(mapping.calls(), 1);
+
+        meta.invalidate();
+        // The stale table is still served, so completion does not go blank during the reload.
+        assert_eq!(meta.fields("logs")[0].name, "msg");
+        meta.refresh(&client).await.unwrap();
+        assert_eq!(mapping.calls(), 2);
     }
 }

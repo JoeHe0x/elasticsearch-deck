@@ -1808,6 +1808,7 @@ dependencies = [
  "es-deck-schema",
  "es-dsl-core",
  "es-dsl-lsp",
+ "futures",
  "gpui-kit",
  "lsp-server",
  "lsp-types",

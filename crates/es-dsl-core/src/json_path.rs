@@ -47,6 +47,28 @@ pub fn keys(text: &str) -> Vec<KeyTok> {
     out
 }
 
+/// String values assigned to `key`, with the path of the object that holds the key. Used to read
+/// scope switches such as `nested.path`; a value still being typed (no closing quote yet) is skipped.
+pub(crate) fn string_values(text: &str, key: &str) -> Vec<(Vec<Seg>, String)> {
+    keys(text)
+        .into_iter()
+        .filter(|k| k.name == key)
+        .filter_map(|k| {
+            let rest = text[k.range.end..].trim_start();
+            let rest = rest.strip_prefix(':')?.trim_start();
+            let mut chars = rest.strip_prefix('"')?.chars();
+            let mut value = String::new();
+            loop {
+                match chars.next()? {
+                    '\\' => value.push(chars.next()?),
+                    '"' => return Some((k.parent, value)),
+                    c => value.push(c),
+                }
+            }
+        })
+        .collect()
+}
+
 /// The JSON path at `cursor` (byte offset) inside the request block that holds it; empty when the
 /// cursor is on a request line or outside any block.
 pub fn path_at(text: &str, cursor: usize) -> Vec<Seg> {
@@ -272,6 +294,24 @@ mod tests {
                 (vec![k("c"), Seg::Index(0)], "d".to_string(), "\"d\""),
             ]
         );
+    }
+
+    #[test]
+    fn string_values_carry_the_object_path() {
+        let text = r#"{"query":{"nested":{"path":"reviews","query":{"nested":{"path":"items"}}}}"#;
+        assert_eq!(
+            string_values(text, "path"),
+            [
+                (vec![k("query"), k("nested")], "reviews".to_string()),
+                (
+                    vec![k("query"), k("nested"), k("query"), k("nested")],
+                    "items".to_string()
+                ),
+            ]
+        );
+        // A value still being typed has no closing quote and is not reported.
+        assert!(string_values(r#"{"nested":{"path":"rev"#, "path").is_empty());
+        assert!(string_values(r#"{"path": 3}"#, "path").is_empty());
     }
 
     #[test]

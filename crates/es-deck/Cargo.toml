@@ -11,6 +11,7 @@ es-deck-schema = { path = "../es-deck-schema" }
 es-dsl-core = { path = "../es-dsl-core" }
 es-dsl-lsp = { path = "../es-dsl-lsp" }
 dirs = "6"
+futures = "0.3"
 gpui-kit.workspace = true
 lsp-server.workspace = true
 lsp-types.workspace = true

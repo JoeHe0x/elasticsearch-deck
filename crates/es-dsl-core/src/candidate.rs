@@ -18,6 +18,18 @@ pub enum Kind {
     Value,
     /// A field of the target index, from its mapping.
     Field,
+    /// A field name used as a value, an element of `sort`, `_source.includes` or `fields`.
+    /// It is inserted alone, without the `: ` that a key gets.
+    FieldValue,
+    /// An index or alias name used as a value, e.g. `_index` in a `_bulk` action line.
+    IndexValue,
+}
+
+/// The JSON container a candidate's value needs, so a client can insert `{}` or `[]` after the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Object,
+    Array,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +39,14 @@ pub struct Candidate {
     pub kind: Kind,
     /// Short type description: a schema type for keys and parameters, the mapping type for fields.
     pub detail: Option<String>,
+    /// For keys: the container its value takes, when the schema says so unambiguously.
+    pub shape: Option<Shape>,
+    /// First paragraph of the spec description, for a documentation popup.
+    pub doc: Option<String>,
+    /// The server-side default (spec `serverDefault`), as JSON text.
+    pub default: Option<String>,
+    /// The spec marks this property deprecated.
+    pub deprecated: bool,
 }
 
 impl Candidate {
@@ -35,7 +55,25 @@ impl Candidate {
             label: label.into(),
             kind,
             detail,
+            shape: None,
+            doc: None,
+            default: None,
+            deprecated: false,
         }
+    }
+
+    /// Records the value's container; only keys get one, because fields leave the value to the user.
+    pub(crate) fn shaped(mut self, shape: Option<Shape>) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    /// Copies what the schema says about a declared property, for the client's popup.
+    pub(crate) fn documented(mut self, prop: &crate::Prop) -> Self {
+        self.doc = prop.doc.clone();
+        self.default = prop.default.clone();
+        self.deprecated = prop.deprecated;
+        self
     }
 }
 

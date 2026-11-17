@@ -17,7 +17,9 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::AlertDialog;
-use gpui_kit::component::input::{Editor, EditorState, Enter, Input, InputEvent, InputState};
+use gpui_kit::component::input::{
+    Editor, EditorState, Enter, Input, InputEditsEvent, InputEvent, InputState, ShowCompletions,
+};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::menu::{
@@ -124,12 +126,17 @@ pub fn set_menus(cx: &mut App, pref: Pref, readonly: bool) {
 
 /// Binds Ctrl/Cmd+Enter to [`Send`] and Ctrl/Cmd+Shift+F to [`Format`] inside editors. It must run
 /// after `gpui_kit::init`: a later binding wins over the editor's own Ctrl/Cmd+Enter, which would
-/// insert a newline.
+/// insert a newline. Ctrl+Space asks for completions where no character has been typed yet.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(SEND_KEY, Send, Some("Input")),
         KeyBinding::new(FORMAT_KEY, Format, Some("Input")),
         KeyBinding::new("enter", Newline, Some("Input")),
+        KeyBinding::new(
+            "ctrl-space",
+            ShowCompletions,
+            Some("Input && mode == editor"),
+        ),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
         KeyBinding::new(CLOSE_TAB_KEY, CloseTab, None),
@@ -308,6 +315,31 @@ impl Console {
             }
         })
         .detach();
+        // The kit inserts a completion's text verbatim, so a completion that supplies `{}` or `[]`
+        // leaves the caret after the closing bracket. Move it between the brackets, where the user
+        // continues. Only the completion's own shape (`": {}"` / `": []"`) qualifies; typing `{`
+        // already auto-closes with the caret inside and never produces this suffix.
+        cx.subscribe(&editor, |this, _, ev: &InputEditsEvent, cx| {
+            let Some((edit, after)) = ev.edits().last() else {
+                return;
+            };
+            let inserted = after.slice(edit.start_byte..edit.new_end_byte).to_string();
+            if edit.old_end_byte == edit.start_byte
+                || !(inserted.ends_with(": {}") || inserted.ends_with(": []"))
+            {
+                return;
+            }
+            if this.editor.read(cx).cursor() != edit.new_end_byte {
+                return;
+            }
+            let inside = edit.new_end_byte - 1;
+            let editor = this.editor.clone();
+            cx.spawn(async move |_, cx| {
+                editor.update(cx, |state, cx| state.set_selected_range(inside..inside, cx));
+            })
+            .detach();
+        })
+        .detach();
         let paint = Paint::new(&editor, cx);
         paint.refresh(text, cx);
         // Any editor notification may be a cursor move, so what depends on the cursor is recomputed
@@ -474,6 +506,10 @@ impl Console {
                 state.route_overlay_action(Box::new(enter), window, cx)
             });
             if taken {
+                // The menu propagates while accepting so a key it ignores still reaches the
+                // editor. Here it took the key: without this the same Enter would also run the
+                // kit's newline and split the line under the inserted completion.
+                cx.stop_propagation();
                 return;
             }
         }
@@ -1480,7 +1516,10 @@ impl Console {
                 if tick.is_multiple_of(CATALOG_EVERY) {
                     let _ = this.update(cx, |this, cx| this.load_catalog(cx));
                 }
-                cx.background_executor().timer(REFRESH_EVERY).await;
+                // Completion wakes this loop when it asks for a mapping the cache lacks, so the
+                // first request against a new target waits for a round trip, not a full tick.
+                let timer = Box::pin(cx.background_executor().timer(REFRESH_EVERY));
+                let _ = futures::future::select(timer, Box::pin(meta.wanted())).await;
             }
         }));
     }
@@ -2341,6 +2380,198 @@ mod tests {
         let value = cx.update(|cx| editor.read(cx).value().to_string());
         // The typed `"q` is replaced by the whole quoted key.
         assert_eq!(value, "POST idx/_search\n{\n  \"query\": ");
+    }
+
+    /// Accepting a key that the schema says takes an object inserts `{}` and puts the caret inside,
+    /// so the next completion is already at the object's keys.
+    #[gpui_kit::test]
+    fn accepting_an_object_key_leaves_the_caret_inside_the_braces(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut index = sample_index();
+        index.endpoints[0].body = vec![es_dsl_core::Prop::new(
+            "query",
+            es_dsl_core::TypeRef::Named("QueryContainer".into()),
+        )];
+        index.types.insert(
+            "QueryContainer".into(),
+            vec![es_dsl_core::Prop::new(
+                "bool",
+                es_dsl_core::TypeRef::Named("BoolQuery".into()),
+            )],
+        );
+        index.types.insert(
+            "BoolQuery".into(),
+            vec![es_dsl_core::Prop::new("must", es_dsl_core::TypeRef::Other)],
+        );
+        let client = LspClient::start(index.clone(), None, es_dsl_core::NoFields).unwrap();
+        let (window, console) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    let library = cx.new(|_| Library::blank());
+                    cx.new(|cx| {
+                        Console::new(
+                            "",
+                            index,
+                            client,
+                            library,
+                            PathBuf::from("unused.json"),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        let doc = "POST idx/_search\n{\n  \"";
+
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            editor.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_value(doc, window, cx);
+                state.set_selected_range(doc.len()..doc.len(), cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.input("q", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("completion-menu").is_some(),
+                "menu did not open"
+            );
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| window.press("enter", cx))
+            .unwrap();
+        cx.run_until_parked();
+        let (value, cursor) = cx.update(|cx| {
+            let state = editor.read(cx);
+            (state.value().to_string(), state.cursor())
+        });
+        assert_eq!(value, "POST idx/_search\n{\n  \"query\": {}");
+        assert_eq!(cursor, value.len() - 1, "caret is between the braces");
+    }
+
+    /// A bare quote must not open the menu: with nothing typed the kit preselects its first item,
+    /// so the next Enter would insert it (and its `: `) instead of breaking the line. Typing a
+    /// character still asks, and so does Ctrl+Space.
+    #[gpui_kit::test]
+    fn a_bare_quote_does_not_open_the_menu(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(bind_keys);
+        struct Fields;
+        impl es_dsl_core::Fields for Fields {
+            fn fields(&self, _target: &str) -> std::sync::Arc<[es_dsl_core::Field]> {
+                std::sync::Arc::from(["sku", "title"].map(|n| es_dsl_core::Field {
+                    name: n.into(),
+                    ty: "keyword".into(),
+                    nested: false,
+                }))
+            }
+        }
+        let mut index = sample_index();
+        index.endpoints[0].body = vec![es_dsl_core::Prop::new(
+            "query",
+            es_dsl_core::TypeRef::Named("QueryContainer".into()),
+        )];
+        index.types.insert(
+            "QueryContainer".into(),
+            vec![es_dsl_core::Prop::new(
+                "term",
+                es_dsl_core::TypeRef::FieldDict(Box::new(es_dsl_core::TypeRef::Named(
+                    "TermQuery".into(),
+                ))),
+            )],
+        );
+        index.types.insert(
+            "TermQuery".into(),
+            vec![es_dsl_core::Prop::new("value", es_dsl_core::TypeRef::Other)],
+        );
+        let client = LspClient::start(index.clone(), None, Fields).unwrap();
+        let (window, console) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    let library = cx.new(|_| Library::blank());
+                    cx.new(|cx| {
+                        Console::new(
+                            "",
+                            index,
+                            client,
+                            library,
+                            PathBuf::from("unused.json"),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        let doc = "POST idx/_search\n{\n  \n}";
+        let at = doc.find("\n}").unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            editor.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_value(doc, window, cx);
+                state.set_selected_range(at..at, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let menu_open = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find("completion-menu").is_some()
+            })
+            .unwrap()
+        };
+        let input = |cx: &mut TestAppContext, text: &str| {
+            cx.update_window(window, |_, window, cx| window.input(text, cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let enter = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| window.press("enter", cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+
+        // `query` and `term` in turn, each accepted from a typed prefix.
+        for (prefix, key) in [("q", "query"), ("t", "term")] {
+            input(cx, "\"");
+            input(cx, prefix);
+            assert!(menu_open(cx), "no menu for {key}");
+            enter(cx);
+        }
+        // This is where the user typed a quote: the menu stays closed, so Enter breaks the line.
+        input(cx, "\"");
+        assert!(!menu_open(cx), "a bare quote opened the menu");
+
+        // Ctrl+Space asks explicitly and offers the mapping fields.
+        cx.update_window(window, |_, window, cx| window.press("ctrl-space", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(menu_open(cx), "Ctrl+Space did not open the menu");
+        enter(cx);
+
+        let (value, cursor) = cx.update(|cx| {
+            let state = editor.read(cx);
+            (state.value().to_string(), state.cursor())
+        });
+        assert_eq!(
+            value,
+            "POST idx/_search\n{\n  \"query\": {\"term\": {\"sku\": }}\n}"
+        );
+        assert_eq!(cursor, value.find("\"sku\": ").unwrap() + "\"sku\": ".len());
     }
 
     /// Opening an index's console from inside a window update, as a list click does, replaces the editor text.

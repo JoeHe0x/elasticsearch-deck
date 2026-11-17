@@ -12,9 +12,9 @@ mod safety;
 mod schema;
 
 pub use analyze::{Diagnostic, Hover, Severity, diagnostics, hover};
-pub use candidate::{Candidate, Kind};
+pub use candidate::{Candidate, Kind, Shape};
 pub use complete::{NoCompletion, candidates_with, complete, complete_with};
-pub use fields::{Field, Fields, NoFields, parse_aliases, parse_mapping, parse_names};
+pub use fields::{Field, FieldKind, Fields, NoFields, parse_aliases, parse_mapping, parse_names};
 pub use format::{Edit, format_body};
 pub use highlight::{Token, block_spans, tokens};
 pub use json_path::{Cursor, KeyTok, Seg, Slot, cursor_at, keys, path_at};
