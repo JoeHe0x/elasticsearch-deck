@@ -22,7 +22,7 @@ struct State {
 }
 
 /// Index and alias names are re-read at most this often.
-const NAMES_TTL: Duration = Duration::from_secs(30);
+const NAMES_TTL: Duration = Duration::from_secs(60);
 
 /// Shared cache; clones see the same data.
 #[derive(Clone, Default)]

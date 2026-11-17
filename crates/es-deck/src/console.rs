@@ -53,7 +53,7 @@ use crate::targets::{ConsoleOp, Folder, Row, Targets, search_text};
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 /// Nodes, templates, tasks and pipelines are re-read every this many metadata refreshes.
-const CATALOG_EVERY: u32 = 15;
+const CATALOG_EVERY: u32 = 30;
 
 /// Quiet time after the last keystroke before the document is checked.
 const LINT_DELAY: Duration = Duration::from_millis(400);
@@ -1145,7 +1145,7 @@ impl Console {
         });
     }
 
-    /// Re-reads the nodes, templates, tasks and pipelines now.
+    /// Re-reads the nodes, templates, tasks and pipelines.
     fn load_catalog(&mut self, cx: &mut Context<Self>) {
         let Some(http) = self.http.clone() else {
             return;
@@ -1235,6 +1235,11 @@ impl Console {
         self.refresh = Some(cx.spawn(async move |this, cx| {
             let mut tick = 0u32;
             loop {
+                // Nothing is polled while the app is in the background; the first tick back catches up.
+                if cx.update(|cx| cx.active_window().is_none()) {
+                    cx.background_executor().timer(REFRESH_EVERY).await;
+                    continue;
+                }
                 // A failed refresh keeps the previous data; the next tick retries.
                 let reached = meta.refresh(&http).await.is_ok();
                 let names = es_dsl_core::Fields::names(&meta);
@@ -1384,7 +1389,7 @@ impl Console {
                     .small()
                     .icon(IconName::Play)
                     .primary()
-                    .disabled(sending)
+                    .loading(sending)
                     .tooltip(format!("Send the request at the cursor ({SEND_SHORTCUT})"))
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             )
