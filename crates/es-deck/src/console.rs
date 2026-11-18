@@ -41,7 +41,7 @@ use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
     ParentElement as _, Render, Role, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Task, TestSupportExt as _, Window, actions, div, rems,
+    StyledText, Task, TestSupportExt as _, Window, actions, div, rems,
 };
 
 use crate::appearance::{self, Pref};
@@ -52,7 +52,7 @@ use crate::history_list::HistoryList;
 use crate::hits_table::{self, HitsTable};
 use crate::library::{Changed, Library};
 use crate::lsp_client::LspClient;
-use crate::paint::Paint;
+use crate::paint::{self, Paint};
 use crate::schema_source;
 use crate::surface::Surfaces;
 use crate::targets::{
@@ -346,12 +346,18 @@ pub struct Console {
     crumbs: SharedString,
     /// The request under the cursor, as framed in the editor.
     active_block: Option<Range<usize>>,
+    /// The request line under the cursor, as the title bar's context crumb shows it.
+    request_line: SharedString,
+    /// The tree line the user last picked. While it is set the title bar names that row's path,
+    /// which is where the user just went; opening or switching a tab, or moving the caret to a
+    /// request, hands the title bar back to the console.
+    tree_crumb: Option<TreeCrumb>,
     run: Run,
     /// The in-flight request; dropping it aborts the call.
     sending: Option<Task<()>>,
     index: Arc<Index>,
     client: Arc<LspClient>,
-    /// Whether the last metadata refresh reached the cluster; drives the tree's status dot.
+    /// Whether the last metadata refresh reached the cluster; drives the connection crumb's dot.
     online: bool,
     /// Whether the tree panel is shown.
     sidebar_open: bool,
@@ -448,12 +454,19 @@ impl Console {
                 .find(|b| cursor >= b.start)
                 .or_else(|| spans.first())
                 .cloned();
+            let line = block_request_line(&text, block.as_ref());
             if block != this.active_block {
                 this.paint.set_active(block.clone(), cx);
                 this.active_block = block;
             }
             if crumbs != this.crumbs {
                 this.crumbs = crumbs;
+                cx.notify();
+            }
+            if line != this.request_line {
+                this.request_line = line.into();
+                // The caret is back in a request, so the title bar names it rather than the tree.
+                this.tree_crumb = None;
                 cx.notify();
             }
         })
@@ -485,6 +498,31 @@ impl Console {
                 }));
         });
         cx.subscribe(&targets, |this, list, ev: &ListEvent, cx| {
+            // Every selection is a place the user went, so the title bar names it until a tab or
+            // the editor takes over. A click arrives as `Confirm`, the arrow keys as `Select`.
+            match ev {
+                ListEvent::Select(_) | ListEvent::Confirm(_) => {
+                    let path = list
+                        .read(cx)
+                        .delegate()
+                        .selected_path()
+                        .map(|(folder, label)| TreeCrumb {
+                            folder,
+                            label: label.map(SharedString::from),
+                        });
+                    if path != this.tree_crumb {
+                        this.tree_crumb = path;
+                        cx.notify();
+                    }
+                }
+                // Escape drops the highlight; the title bar must not keep naming a line that no
+                // longer reads as selected.
+                ListEvent::Cancel => {
+                    if this.tree_crumb.take().is_some() {
+                        cx.notify();
+                    }
+                }
+            }
             if let ListEvent::Confirm(ix) = ev {
                 let mut double = false;
                 let picked = list.update(cx, |list, cx| {
@@ -566,6 +604,11 @@ impl Console {
         // The editor's draft is restored on startup, so the connection it ran against is too.
         panel.update(cx, |p, cx| p.reconnect_last(window, cx));
         let split = cx.new(|_| ResizableState::default());
+        // The editor was built with the restored text but has not notified yet, so the title bar's
+        // request line comes from that same text rather than waiting for an event.
+        let request_line: SharedString = es_dsl_core::block_at(text, 0)
+            .map(|block| block_request_line(text, Some(&block.line)).into())
+            .unwrap_or_default();
         Self {
             editor,
             panel,
@@ -588,6 +631,8 @@ impl Console {
             problems: None,
             crumbs: SharedString::default(),
             active_block: None,
+            request_line,
+            tree_crumb: None,
             run: Run::Idle,
             sending: None,
             index: Arc::new(index),
@@ -924,12 +969,29 @@ impl Console {
 
     /// Shows the console called `name` in the editor and makes it the one that autosaves.
     fn open_console(&mut self, name: String, text: String, cx: &mut Context<Self>) {
+        self.open_console_at(name, text, None, cx);
+    }
+
+    /// Opens a console with the caret on `cursor`, a byte offset into `text`. Without one the
+    /// caret goes to the first request line, so the title bar names this tab's first request
+    /// instead of whatever offset the previous tab's caret lands on. Opening a request from the
+    /// tree passes its offset: the request that was just opened is what the title bar should name,
+    /// even when the console already contained it and its text did not change.
+    fn open_console_at(
+        &mut self,
+        name: String,
+        text: String,
+        cursor: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         let editor = self.editor.clone();
         let Some(window) = cx.active_window() else {
             return;
         };
         // The pause before the autosave would otherwise lose the last edits of the console being left.
         self.save_active(cx);
+        // A tab is the location now, so the tree's selection no longer names the title bar.
+        self.tree_crumb = None;
         if !self.tabs.contains(&name) {
             self.tabs.push(name.clone());
         }
@@ -938,6 +1000,8 @@ impl Console {
         let leaving = std::mem::replace(&mut self.active, name.clone());
         let shown = (leaving != name).then(|| self.swap_pane(leaving, &name, cx));
         let response = self.response.clone();
+        let cursor = cursor
+            .unwrap_or_else(|| es_dsl_core::block_at(&text, 0).map_or(0, |block| block.line.start));
         // Opened from a list click, the window is busy with that event and refuses a direct update,
         // which would leave the old text in the editor; a task runs once the event is done.
         cx.spawn(async move |this, cx| {
@@ -947,6 +1011,7 @@ impl Console {
                 }
                 editor.update(cx, |state, cx| {
                     state.set_value(text, window, cx);
+                    state.set_selected_range(cursor..cursor, cx);
                     state.focus(window, cx);
                 });
             });
@@ -993,9 +1058,13 @@ impl Console {
         let text = match self.library.read(cx).console(&conn, &name) {
             Some(old) if old.contains(&search) => old,
             Some(old) => format!("{}\n\n{search}", old.trim_end()),
-            None => search,
+            None => search.clone(),
         };
-        self.open_console(name, text, cx);
+        // Put the caret on the request that was opened, not the first in the document: when the
+        // console already held it the text does not change, and the title bar would otherwise keep
+        // naming whatever request the old caret sat in.
+        let at = text.find(&search);
+        self.open_console_at(name, text, at, cx);
     }
 
     /// The index or alias selected in the tree, for the keyboard shortcuts.
@@ -1034,6 +1103,8 @@ impl Console {
     /// Makes the Data Browser tab `key` the shown one; the console it replaces is saved and parked.
     fn activate_browser(&mut self, key: String, cx: &mut Context<Self>) {
         self.save_active(cx);
+        // The tab shows a target now; the tree's selected line stops naming the title bar.
+        self.tree_crumb = None;
         if !self.tabs.contains(&key) {
             self.tabs.push(key.clone());
         }
@@ -1572,6 +1643,7 @@ impl Console {
         // not linger either.
         self.tabs = vec![saved::AUTO_CONSOLE.into()];
         self.active = saved::AUTO_CONSOLE.into();
+        self.tree_crumb = None;
         self.panes.clear();
         self.browsers.clear();
         (self.hits, self.tree, self.full_body) = (None, None, None);
@@ -1725,6 +1797,7 @@ impl Console {
         self.tabs = vec![saved::AUTO_CONSOLE.into()];
         self.panes.clear();
         self.browsers.clear();
+        self.tree_crumb = None;
         // Empty until `open_console` names the tab, so it does not save the old text under the
         // new connection.
         self.active.clear();
@@ -1830,6 +1903,111 @@ impl Console {
     }
 }
 
+/// A line of the tree as a path: its folder and, for a row, its name. The folder line itself has
+/// no name, so the title bar shows the folder alone while it is selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeCrumb {
+    folder: Folder,
+    label: Option<SharedString>,
+}
+
+/// What the title bar shows after the connection: the Data Browser's target, the request under the
+/// cursor, or the console's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TitleContext {
+    Browser(String),
+    Request(String),
+    Console(String),
+}
+
+/// The context crumb for `active`: a Data Browser key becomes its target, otherwise the request at
+/// the cursor, otherwise the console's name. `None` before a connection exists.
+fn title_context(active: &str, request_line: &str) -> Option<TitleContext> {
+    if active.is_empty() {
+        return None;
+    }
+    if let Some(target) = active.strip_prefix(BROWSER_PREFIX) {
+        return Some(TitleContext::Browser(target.to_owned()));
+    }
+    Some(if request_line.is_empty() {
+        TitleContext::Console(active.to_owned())
+    } else {
+        TitleContext::Request(request_line.to_owned())
+    })
+}
+
+/// The first line of `block`, which is the request line a run would send.
+fn block_request_line(text: &str, block: Option<&Range<usize>>) -> String {
+    let Some(block) = block else {
+        return String::new();
+    };
+    text.get(block.start..)
+        .and_then(|rest| rest.lines().next())
+        .map_or_else(String::new, |line| line.trim_end().to_owned())
+}
+
+/// A read-only crumb: an icon and a label, truncated so a long target does not push the title
+/// bar's commands off screen. The id and accessible name let a test read the crumb without
+/// guessing which of the tree's matching labels it found.
+fn context_crumb(
+    id: &'static str,
+    icon: IconName,
+    label: SharedString,
+    muted: Hsla,
+) -> impl IntoElement {
+    let name = label.clone();
+    div()
+        .id(id)
+        .aria_label(name)
+        .flex()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .max_w(rems(20.))
+        .px_1()
+        .text_sm()
+        .text_color(muted)
+        .child(Icon::new(icon).size_4().flex_none())
+        .child(div().min_w_0().truncate().child(label))
+        // A plain div is not part of the native tree; observing it lets a test read the crumb's
+        // name without matching the same text in the tree below.
+        .test_support()
+}
+
+/// A request line in the console's own colors: the same tokens and weights the editor paints, so
+/// the crumb names the request the way the request itself is shown. The accessible name stays the
+/// whole line.
+fn request_crumb(
+    id: &'static str,
+    line: SharedString,
+    dark: bool,
+    muted: Hsla,
+) -> impl IntoElement {
+    let highlights = es_dsl_core::tokens(line.as_ref())
+        .into_iter()
+        .map(|(range, token)| (range, paint::style(token, dark)))
+        .collect::<Vec<_>>();
+    div()
+        .id(id)
+        .aria_label(line.clone())
+        .flex()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .max_w(rems(20.))
+        .px_1()
+        .text_sm()
+        .text_color(muted)
+        .child(Icon::new(IconName::Braces).size_4().flex_none())
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(StyledText::new(line).with_highlights(highlights)),
+        )
+        .test_support()
+}
+
 /// Title-bar controls must not start a window drag, which would swallow their click.
 fn no_drag(_: &MouseDownEvent, window: &mut Window, cx: &mut App) {
     window.prevent_default();
@@ -1845,12 +2023,7 @@ fn install(state: &mut EditorState, client: &Arc<LspClient>) {
 
 impl Console {
     fn render_titlebar(&self, surfaces: Surfaces, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = self
-            .summary
-            .as_ref()
-            .map_or("Connect…".into(), |s| s.name.clone());
         let muted = cx.theme().muted_foreground;
-        let console = cx.entity();
         let version = self
             .summary
             .as_ref()
@@ -1861,71 +2034,214 @@ impl Console {
             .bg(surfaces.ground)
             .border_0()
             // macOS draws the menus in the screen's menu bar; a second copy here would repeat
-            // every command inside the window. There the menu bar is also what pushes the
-            // commands to the right end, so a spacer takes its place.
+            // every command inside the window.
             .when(!cfg!(target_os = "macos"), |this| {
                 this.child(self.menu_bar.clone())
             })
-            .when(cfg!(target_os = "macos"), |this| this.child(div().flex_1()))
+            .child(self.render_crumbs(cx))
+            .child(div().flex_1())
             .child(self.render_toolbar(cx))
             .child(
                 div()
-                    .flex()
-                    .justify_end()
+                    .pl_2()
+                    .pr_3()
                     .text_sm()
                     .text_color(muted)
                     .child(version),
             )
-            .child(div().on_mouse_down(MouseButton::Left, no_drag).child({
-                let (panel, current) = (self.panel.clone(), label.to_string());
-                Button::new("connections")
-                    .ghost()
-                    .icon(IconName::Database)
-                    .small()
-                    .label(label)
-                    .dropdown_caret(true)
-                    .dropdown_menu(move |menu, _, cx| {
-                        let names = panel.read(cx).names();
-                        let empty = names.is_empty();
-                        let menu = names.into_iter().fold(menu, |menu, name| {
-                            let panel = panel.clone();
-                            let target = name.clone();
-                            menu.item(
-                                PopupMenuItem::new(name.clone())
-                                    .icon(IconName::Database)
-                                    .checked(name == current)
-                                    .on_click(move |_, window, cx| {
-                                        panel.update(cx, |p, cx| p.switch_to(&target, window, cx))
-                                    }),
-                            )
-                        });
-                        let (add, manage) = (console.clone(), console.clone());
-                        // The check sits on the right so every entry keeps its connection icon.
-                        menu.check_side(Side::Right)
-                            .when(empty, |menu| {
-                                menu.item(PopupMenuItem::label("No saved connections"))
-                            })
-                            .separator()
-                            .item(
-                                PopupMenuItem::new("Add connection…")
-                                    .icon(IconName::Plus)
-                                    .on_click(move |_, window, cx| {
-                                        add.update(cx, |this, cx| {
-                                            this.open_connections(Some(false), window, cx)
-                                        })
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("Manage connections…")
-                                    .icon(IconName::Settings)
-                                    .on_click(move |_, window, cx| {
-                                        manage.update(cx, |this, cx| {
-                                            this.open_connections(None, window, cx)
-                                        })
-                                    }),
-                            )
+    }
+
+    /// Where the window is: the connection, then the active tab's target or request — or, while
+    /// the user is picking a line in the tree, that line's folder and name. The context crumb
+    /// changes with the tab or the tree, so the title bar names the place below it without adding
+    /// another row inside the panes.
+    fn render_crumbs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let dark = cx.theme().is_dark();
+        let separator = || {
+            Icon::new(IconName::ChevronRight)
+                .size_3()
+                .flex_none()
+                .text_color(muted)
+        };
+        let connected = self.summary.is_some();
+        let tree = connected.then(|| self.tree_crumb.clone()).flatten();
+        let context = connected
+            .then(|| title_context(&self.active, &self.request_line))
+            .flatten();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, no_drag)
+            .child(self.render_connection_crumb(cx));
+        if let Some(crumb) = tree {
+            row = row.child(separator()).child(context_crumb(
+                "crumb-folder",
+                crumb.folder.icon(),
+                crumb.folder.title().into(),
+                muted,
+            ));
+            if let Some(label) = crumb.label {
+                row = row.child(separator()).child(match crumb.folder {
+                    Folder::Indices | Folder::Aliases => self
+                        .render_target_crumb(label.to_string(), cx)
+                        .into_any_element(),
+                    _ => context_crumb("crumb-row", crumb.folder.icon(), label, muted)
+                        .into_any_element(),
+                });
+            }
+        } else if let Some(context) = context {
+            row = row.child(separator());
+            row = match context {
+                TitleContext::Browser(target) => {
+                    row.child(self.render_target_crumb(target, cx).into_any_element())
+                }
+                // A REST console is two steps: the console the request lives in, then the
+                // request under the caret. Naming only the request would drop the level that
+                // says which console the window shows.
+                TitleContext::Request(line) => {
+                    let console = self.active.clone();
+                    row.child(context_crumb(
+                        "crumb-console",
+                        IconName::SquareTerminal,
+                        console.into(),
+                        muted,
+                    ))
+                    .child(separator())
+                    .child(request_crumb(
+                        "crumb-request",
+                        line.into(),
+                        dark,
+                        muted,
+                    ))
+                }
+                TitleContext::Console(name) => row.child(context_crumb(
+                    "crumb-console",
+                    IconName::SquareTerminal,
+                    name.into(),
+                    muted,
+                )),
+            };
+        }
+        row
+    }
+
+    /// The connection switcher: the same menu as before, sized like a crumb so it reads as the
+    /// first step of the path rather than as a lone command. Its status dot shows whether the
+    /// cluster answered the last refresh, so the connection's health lives with the connection.
+    fn render_connection_crumb(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (dot, status) = if self.online {
+            (theme.success, "Connected")
+        } else {
+            (theme.danger, "The cluster did not answer the last refresh")
+        };
+        let label = self
+            .summary
+            .as_ref()
+            .map_or("Connect…".into(), |s| s.name.clone());
+        let current = label.to_string();
+        let panel = self.panel.clone();
+        let console = cx.entity();
+        let switcher = Button::new("connections")
+            .ghost()
+            .icon(IconName::Database)
+            .small()
+            .label(label)
+            .max_w(rems(16.))
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, cx| {
+                let names = panel.read(cx).names();
+                let empty = names.is_empty();
+                let menu = names.into_iter().fold(menu, |menu, name| {
+                    let panel = panel.clone();
+                    let target = name.clone();
+                    menu.item(
+                        PopupMenuItem::new(name.clone())
+                            .icon(IconName::Database)
+                            .checked(name == current)
+                            .on_click(move |_, window, cx| {
+                                panel.update(cx, |p, cx| p.switch_to(&target, window, cx))
+                            }),
+                    )
+                });
+                let (add, manage) = (console.clone(), console.clone());
+                // The check sits on the right so every entry keeps its connection icon.
+                menu.check_side(Side::Right)
+                    .when(empty, |menu| {
+                        menu.item(PopupMenuItem::label("No saved connections"))
                     })
-            }))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Add connection…")
+                            .icon(IconName::Plus)
+                            .on_click(move |_, window, cx| {
+                                add.update(cx, |this, cx| {
+                                    this.open_connections(Some(false), window, cx)
+                                })
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Manage connections…")
+                            .icon(IconName::Settings)
+                            .on_click(move |_, window, cx| {
+                                manage
+                                    .update(cx, |this, cx| this.open_connections(None, window, cx))
+                            }),
+                    )
+            });
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .child(switcher)
+            // Only a connection has a health to report; before one is open the button says
+            // "Connect…" and a dot would have nothing to describe.
+            .when(self.summary.is_some(), |row| {
+                row.child(
+                    div()
+                        .id("connection-status")
+                        .role(Role::Status)
+                        .aria_label(status)
+                        .flex_none()
+                        .pl_1()
+                        .child(div().size_1p5().rounded_full().bg(dot)),
+                )
+            })
+    }
+
+    /// The active Data Browser's target. Its menu leads to the REST console for the same target,
+    /// where a request that the table cannot express belongs.
+    fn render_target_crumb(&self, target: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let console = cx.entity();
+        let open_name = target.clone();
+        let copy_name = target.clone();
+        Button::new("crumb-target")
+            .ghost()
+            .small()
+            .icon(IconName::Table2)
+            .label(SharedString::from(target))
+            .max_w(rems(16.))
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                let (open, name) = (console.clone(), open_name.clone());
+                menu.item(
+                    PopupMenuItem::new("Open in REST Console")
+                        .icon(IconName::SquareTerminal)
+                        .on_click(move |_, _, cx| {
+                            let name = name.clone();
+                            open.update(cx, |this, cx| this.open_named(name, cx))
+                        }),
+                )
+                .item(PopupMenuItem::new("Copy name").on_click({
+                    let name = copy_name.clone();
+                    move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(name.clone()))
+                }))
+            })
     }
 
     /// Always-visible commands, in the title bar next to the menus; the same ones are in the menus.
@@ -2426,38 +2742,17 @@ impl Render for Console {
         let meta = self.meta.clone();
         let theme = cx.theme();
         let surfaces = Surfaces::new(theme);
-        let dot = if self.online {
-            theme.success
-        } else {
-            theme.danger
-        };
         // Islands: flat rounded panels on the window ground, separated by one gutter width. The
         // surface module owns the tone relationship, so this render does not need a mode-specific
         // blend of its own.
         let radius = theme.radius_lg;
         let card = move || div().overflow_hidden().rounded(radius).bg(surfaces.panel);
-        // The sidebar only exists while a connection is open, so the name and its dot are enough;
-        // the title bar already carries the version.
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .truncate()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(SharedString::from(self.connection_name())),
-            )
-            .child(div().size_1p5().flex_none().rounded_full().bg(dot));
+        // The sidebar only exists while a connection is open. Its name and health are in the
+        // title bar's connection crumb, so the tree begins with its commands, right-aligned on a
+        // full-width row that a divider separates from the list.
         // The tree's commands are a toolbar, not a bare row of buttons: the toolbar gives them
         // the Toolbar role and arrow-key focus between them, which a flex row does not.
-        // The border splits the toolbar from the name above it; it belongs to the toolbar row
-        // rather than sitting in a wrapper, so the two stay one header block.
         let actions = Toolbar::new("tree-toolbar")
-            .border_t_1()
-            .border_color(theme.border)
             .child(
                 tool("tree-filter", IconName::Search, "Filter the tree")
                     .selected(self.filter_open)
@@ -2491,16 +2786,25 @@ impl Render for Console {
             );
         let targets = card()
             .size_full()
-            .p_2()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(header)
-            .child(actions)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .px_2()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(actions),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
+                    .px_2()
+                    .pb_2()
+                    .pt_1()
                     .child(List::new(&self.targets).search_placeholder("Filter")),
             );
         div()
@@ -3309,6 +3613,10 @@ mod tests {
                 saved::AUTO_CONSOLE,
                 "the console is in front again"
             );
+            assert_eq!(
+                &*console.request_line, "GET _nodes/n1",
+                "the title bar names the request the click opened"
+            );
         });
     }
 
@@ -3439,6 +3747,222 @@ mod tests {
             cx.update(|cx| editor.read(cx).value().to_string()),
             "GET logs/_search"
         );
+    }
+
+    #[test]
+    fn the_title_bar_context_follows_the_active_tab() {
+        // A Data Browser wins over whatever the hidden console still holds: its target is what
+        // the tab shows.
+        assert_eq!(
+            title_context(&browser_key("logs"), "GET ignored"),
+            Some(TitleContext::Browser("logs".into()))
+        );
+        assert_eq!(
+            title_context("console", "POST logs/_search"),
+            Some(TitleContext::Request("POST logs/_search".into()))
+        );
+        assert_eq!(
+            title_context("console", ""),
+            Some(TitleContext::Console("console".into()))
+        );
+        assert_eq!(title_context("", "GET a"), None);
+    }
+
+    #[test]
+    fn the_request_line_is_the_first_line_of_the_active_block() {
+        let text = "GET a/_search\n\nPOST b/_search?pretty\n{\"x\": 1}\n";
+        let spans = es_dsl_core::block_spans(text);
+        assert_eq!(block_request_line(text, None), "");
+        assert_eq!(block_request_line(text, spans.first()), "GET a/_search");
+        assert_eq!(
+            block_request_line(text, spans.get(1)),
+            "POST b/_search?pretty"
+        );
+    }
+
+    /// The title bar answers "where am I": the connection, then the target the Data Browser shows.
+    #[gpui_kit::test]
+    fn the_title_bar_names_the_connection_and_the_open_target(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "8.19.0".into(),
+                });
+                this.tabs = vec![saved::AUTO_CONSOLE.into(), browser_key("logs")];
+                this.active = browser_key("logs");
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(window.find("connections").label(), Some("c1"));
+            assert_eq!(window.find("crumb-target").label(), Some("logs"));
+        })
+        .unwrap();
+    }
+
+    /// Moving the cursor into another request changes what the context crumb names.
+    #[gpui_kit::test]
+    fn the_title_bar_tracks_the_request_under_the_cursor(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        let doc = "GET a/_search\n\nPOST b/_search\n{\"x\": 1}\n";
+        let at = doc.find("POST").unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            editor.update(cx, |state, cx| {
+                state.set_value(doc, window, cx);
+                state.set_selected_range(at..at, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(&*console.read(cx).request_line, "POST b/_search");
+        });
+    }
+
+    /// Opening a request the console already contained must move the caret to it: the title bar
+    /// names the request that was opened, not the one the caret happened to sit in.
+    #[gpui_kit::test]
+    fn reopening_a_request_moves_the_title_bar_to_it(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let (editor, library) = cx.update(|cx| {
+            let console = console.read(cx);
+            (console.editor.clone(), console.library.clone())
+        });
+        let text = format!("GET a/_search\n\n{}", search_text("logs"));
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.tabs = vec![saved::AUTO_CONSOLE.into(), "logs".into()];
+                this.active = "logs".into();
+            });
+            library.update(cx, |library, cx| {
+                library.set_console("c1", "logs", &text, cx)
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            editor.update(cx, |state, cx| {
+                state.set_value(&text, window, cx);
+                state.set_selected_range(0..0, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(&*console.read(cx).request_line, "GET a/_search");
+        });
+        cx.update(|cx| console.update(cx, |this, cx| this.open_named("logs".into(), cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(&*console.read(cx).request_line, "GET logs/_search");
+        });
+    }
+
+    /// Picking a line in the tree puts its path in the title bar: the folder, then the row. Going
+    /// back to a tab hands the title bar back to the console.
+    #[gpui_kit::test]
+    fn selecting_a_tree_row_names_its_path_in_the_title_bar(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        let (window, console) = console_window(cx);
+        let targets = cx.update(|cx| console.read(cx).targets.clone());
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.http = Some(Arc::new(
+                    Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap(),
+                ));
+            });
+            targets.update(cx, |list, cx| {
+                list.delegate_mut().set(
+                    Folder::Nodes,
+                    vec![Row {
+                        label: "n1".into(),
+                        text: "GET _nodes/n1".into(),
+                        closed: false,
+                    }],
+                );
+                // The folder starts closed; opening it puts its only row on line 2, after the
+                // Consoles and Nodes folder lines.
+                list.delegate_mut().activate(IndexPath::new(1));
+                cx.notify();
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            // A single click selects without opening anything; the row's path is the location.
+            targets.update(cx, |list, cx| {
+                let ix = IndexPath::new(2);
+                list.set_selected_index(Some(ix), window, cx);
+                cx.emit(ListEvent::Confirm(ix));
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                console.read(cx).tree_crumb.is_some(),
+                "the click should set the tree crumb"
+            );
+        });
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(window.find("crumb-folder").label(), Some("Nodes"));
+            assert_eq!(window.find("crumb-row").label(), Some("n1"));
+        })
+        .unwrap();
+        // A tab is the location again: the tree stops naming the title bar.
+        cx.update(|cx| console.update(cx, |this, cx| this.select_tab(0, cx)));
+        cx.run_until_parked();
+        cx.update(|cx| assert!(console.read(cx).tree_crumb.is_none()));
+    }
+
+    /// A REST console path is two levels: the console's name, then the request under the caret.
+    /// Naming only the request would leave out which console the window shows.
+    #[gpui_kit::test]
+    fn the_title_bar_names_the_console_before_the_request(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.tabs = vec!["ops".into()];
+                this.active = "ops".into();
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            editor.update(cx, |state, cx| {
+                state.set_value("GET _cluster/health\n", window, cx);
+                state.set_selected_range(0..0, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(window.find("crumb-console").label(), Some("ops"));
+            assert_eq!(
+                window.find("crumb-request").label(),
+                Some("GET _cluster/health")
+            );
+        })
+        .unwrap();
     }
 
     fn console_window(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<Console>) {

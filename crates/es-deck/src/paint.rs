@@ -40,6 +40,20 @@ pub fn color(token: Token, dark: bool) -> Hsla {
     rgb(if dark { d } else { l }).into()
 }
 
+/// The editor's style for `token`. Shared with surfaces that show a request line outside the
+/// editor — the title bar's crumb — so both read the same instead of one flat string.
+pub fn style(token: Token, dark: bool) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(color(token, dark)),
+        font_weight: match token {
+            Token::Method => Some(FontWeight::BOLD),
+            Token::Endpoint | Token::Property => Some(FontWeight::MEDIUM),
+            _ => None,
+        },
+        ..Default::default()
+    }
+}
+
 impl Paint {
     pub fn new(editor: &Entity<EditorState>, json_only: bool, cx: &mut App) -> Self {
         editor.update(cx, |state, cx| Self {
@@ -63,18 +77,6 @@ impl Paint {
         let accent = theme.blue;
         let dark = theme.is_dark();
         let custom = self.custom.borrow();
-        let style = |token| {
-            let color = color(token, dark);
-            HighlightStyle {
-                color: Some(color),
-                font_weight: match token {
-                    Token::Method => Some(FontWeight::BOLD),
-                    Token::Endpoint | Token::Property => Some(FontWeight::MEDIUM),
-                    _ => None,
-                },
-                ..Default::default()
-            }
-        };
         let spans = if self.json_only {
             json_tokens(text)
         } else {
@@ -87,7 +89,7 @@ impl Paint {
                     Ok(i) if token == Token::Key && custom[i].0.end == range.end => custom[i].1,
                     _ => token,
                 };
-                TextDecoration::new(range, style(token))
+                TextDecoration::new(range, style(token, dark))
             })
             .collect();
         let bars = if self.json_only {

@@ -41,7 +41,7 @@ impl Folder {
         FOLDERS.iter().position(|f| *f == self).unwrap_or(0)
     }
 
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             Self::Consoles => "Consoles",
             Self::Indices => "Indices",
@@ -54,7 +54,7 @@ impl Folder {
     }
 
     /// The icon of a row in this folder.
-    fn icon(self) -> IconName {
+    pub fn icon(self) -> IconName {
         match self {
             Self::Consoles => IconName::SquareTerminal,
             Self::Indices => IconName::Table2,
@@ -171,6 +171,18 @@ impl Targets {
         match self.lines.get(self.selected?.row)? {
             Line::Item(slot, i) => Some((FOLDERS[*slot], self.shown[*slot].get(*i)?)),
             Line::Folder(_) => None,
+        }
+    }
+
+    /// The selected line as the title bar names it: its folder and, for a row, the row's label.
+    /// A folder line has no label, so selecting `Nodes` reads as the folder alone.
+    pub fn selected_path(&self) -> Option<(Folder, Option<&str>)> {
+        match self.lines.get(self.selected?.row)? {
+            Line::Folder(slot) => Some((FOLDERS[*slot], None)),
+            Line::Item(slot, i) => {
+                let row = self.shown[*slot].get(*i)?;
+                Some((FOLDERS[*slot], Some(row.label.as_str())))
+            }
         }
     }
 
@@ -490,5 +502,19 @@ mod tests {
         t.query.clear();
         t.refilter();
         assert_eq!(t.lines, [Line::Folder(0), Line::Folder(3)]);
+    }
+
+    #[test]
+    fn the_selected_line_reads_as_a_folder_then_a_row() {
+        let mut t = Targets::default();
+        t.set(Folder::Nodes, vec![row("n1")]);
+        // Selecting the folder line names the folder alone; its row adds the name.
+        t.selected = Some(at(1));
+        assert_eq!(t.selected_path(), Some((Folder::Nodes, None)));
+        t.activate(at(1));
+        t.selected = Some(at(2));
+        assert_eq!(t.selected_path(), Some((Folder::Nodes, Some("n1"))));
+        t.selected = None;
+        assert_eq!(t.selected_path(), None);
     }
 }
