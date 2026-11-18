@@ -13,6 +13,7 @@ mod library;
 mod lsp_client;
 mod paint;
 mod schema_source;
+mod settings;
 mod surface;
 mod targets;
 

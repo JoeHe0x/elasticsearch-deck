@@ -22,6 +22,34 @@ pub enum Pref {
 }
 
 impl Pref {
+    /// The value the choice is stored and offered under, in the file and in Settings.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    /// The choice `key` names, or `None` for anything else.
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    /// How the choice reads to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "Follow system",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
     /// A missing or unreadable file leaves the default; the file holds only this one choice, so a
     /// failed read must not stop the application.
     pub fn load(path: &Path) -> Self {
@@ -108,5 +136,13 @@ mod tests {
         std::fs::write(&path, "blue").unwrap();
         assert_eq!(Pref::load(&path), Pref::System, "unreadable choice");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_settings_key_round_trips() {
+        for pref in [Pref::System, Pref::Light, Pref::Dark] {
+            assert_eq!(Pref::from_key(pref.key()), Some(pref));
+        }
+        assert_eq!(Pref::from_key("blue"), None);
     }
 }

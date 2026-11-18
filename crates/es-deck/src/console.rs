@@ -83,6 +83,9 @@ actions!(
         ToggleReadonly,
         ShowHistory,
         ShowShortcuts,
+        OpenSettings,
+        ShowAbout,
+        Quit,
         NextTab,
         PreviousTab,
         CloseTab,
@@ -92,41 +95,87 @@ actions!(
     ]
 );
 
-/// The application menu: one Action per command, shared with the key bindings. Native on macOS,
-/// drawn by `AppMenuBar` in the title bar elsewhere. The two toggles carry a check mark so the
-/// menu itself says which state is on.
-pub fn app_menus(pref: Pref, readonly: bool) -> Vec<Menu> {
-    vec![
-        Menu::new("Request").items([
-            MenuItem::action("Send", Send),
-            MenuItem::action("Cancel", CancelRequest),
-            MenuItem::separator(),
-            MenuItem::action("Format body", Format),
-        ]),
-        Menu::new("View").items([
-            MenuItem::action("Toggle tree", ToggleTree),
-            MenuItem::action("History…", ShowHistory),
-            MenuItem::action("Readonly", ToggleReadonly).checked(readonly),
-            MenuItem::separator(),
-            MenuItem::action("Follow system appearance", UseSystemAppearance)
-                .checked(pref == Pref::System),
-            MenuItem::action("Light appearance", UseLightAppearance).checked(pref == Pref::Light),
-            MenuItem::action("Dark appearance", UseDarkAppearance).checked(pref == Pref::Dark),
-            MenuItem::separator(),
-            MenuItem::action("Next tab", NextTab),
-            MenuItem::action("Previous tab", PreviousTab),
-            MenuItem::action("Close tab", CloseTab),
-        ]),
-        Menu::new("Help").items([MenuItem::action("Shortcuts", ShowShortcuts)]),
-    ]
+/// The product name, as the macOS application menu shows it.
+const APP_NAME: &str = "elasticsearch-deck";
+
+/// `settings` adds the Settings item, which belongs in this menu only where the platform has no
+/// application menu to hold it. The request commands lead it: they used to have a menu of their
+/// own, but three items did not need a top-level title and the toolbar already shows them.
+fn view_menu(pref: Pref, readonly: bool, settings: bool) -> Menu {
+    let mut items = vec![
+        MenuItem::action("Send", Send),
+        MenuItem::action("Cancel", CancelRequest),
+        MenuItem::separator(),
+        MenuItem::action("Format body", Format),
+        MenuItem::separator(),
+        MenuItem::action("Toggle tree", ToggleTree),
+        MenuItem::action("History…", ShowHistory),
+        MenuItem::action("Readonly", ToggleReadonly).checked(readonly),
+        MenuItem::separator(),
+        MenuItem::action("Follow system appearance", UseSystemAppearance)
+            .checked(pref == Pref::System),
+        MenuItem::action("Light appearance", UseLightAppearance).checked(pref == Pref::Light),
+        MenuItem::action("Dark appearance", UseDarkAppearance).checked(pref == Pref::Dark),
+        MenuItem::separator(),
+        MenuItem::action("Next tab", NextTab),
+        MenuItem::action("Previous tab", PreviousTab),
+        MenuItem::action("Close tab", CloseTab),
+    ];
+    if settings {
+        items.push(MenuItem::separator());
+        items.push(MenuItem::action("Settings…", OpenSettings));
+    }
+    Menu::new("View").items(items)
+}
+
+fn help_menu() -> Menu {
+    Menu::new("Help").items([MenuItem::action("Shortcuts", ShowShortcuts)])
+}
+
+/// The macOS application menu. AppKit shows the first menu under the application's name; without
+/// one, the first menu (`View`) is taken for it and loses its title, leaving only `Help` beside
+/// the Apple menu.
+#[cfg(target_os = "macos")]
+fn application_menu() -> Menu {
+    Menu::new(APP_NAME).items([
+        MenuItem::action("About elasticsearch-deck", ShowAbout),
+        MenuItem::separator(),
+        MenuItem::action("Settings…", OpenSettings),
+        MenuItem::separator(),
+        MenuItem::os_submenu("Services", gpui_kit::SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action("Quit elasticsearch-deck", Quit),
+    ])
+}
+
+/// The commands the window's own menu bar draws, used on Windows and Linux where there is no
+/// application menu.
+fn window_menus(pref: Pref, readonly: bool) -> Vec<Menu> {
+    vec![view_menu(pref, readonly, true), help_menu()]
+}
+
+/// The menus the platform shows. On macOS that starts with the application menu; elsewhere the
+/// window draws the same commands itself.
+fn platform_menus(pref: Pref, readonly: bool) -> Vec<Menu> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut menus = vec![application_menu()];
+        // Settings has a home in the application menu; a second copy in View would duplicate it.
+        menus.extend([view_menu(pref, readonly, false), help_menu()]);
+        menus
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        window_menus(pref, readonly)
+    }
 }
 
 /// Installs the menus in both places they appear: the platform menu bar and the `AppMenuBar` the
 /// title bar draws off macOS. Every toggle that carries a check mark rebuilds them.
 pub fn set_menus(cx: &mut App, pref: Pref, readonly: bool) {
-    cx.set_menus(app_menus(pref, readonly));
+    cx.set_menus(platform_menus(pref, readonly));
     GlobalState::global_mut(cx).set_app_menus(
-        app_menus(pref, readonly)
+        window_menus(pref, readonly)
             .into_iter()
             .map(|m| m.owned())
             .collect(),
@@ -151,6 +200,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
         KeyBinding::new(CLOSE_TAB_KEY, CloseTab, None),
+        KeyBinding::new(SETTINGS_KEY, OpenSettings, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new(QUIT_KEY, Quit, None),
     ]);
 }
 
@@ -173,6 +225,14 @@ const FORMAT_KEY: &str = "ctrl-shift-f";
 const CLOSE_TAB_KEY: &str = "cmd-w";
 #[cfg(not(target_os = "macos"))]
 const CLOSE_TAB_KEY: &str = "ctrl-w";
+
+#[cfg(target_os = "macos")]
+const SETTINGS_KEY: &str = "cmd-,";
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_KEY: &str = "ctrl-,";
+
+#[cfg(target_os = "macos")]
+const QUIT_KEY: &str = "cmd-q";
 
 /// How a search response is shown; other responses are always JSON.
 #[derive(Clone, Copy, PartialEq)]
@@ -1080,14 +1140,26 @@ impl Console {
         self.menu_bar.update(cx, |bar, cx| bar.reload(cx));
     }
 
+    /// The appearance currently applied; the Settings page shows it.
+    pub(crate) fn appearance(&self) -> Pref {
+        self.theme
+    }
+
     /// Applies and remembers the appearance. Both menus are rebuilt because they are where the
-    /// current choice is shown, and a native menu keeps the check marks it was built with.
-    fn set_theme(&mut self, pref: Pref, window: &mut Window, cx: &mut Context<Self>) {
+    /// current choice is shown, and a native menu keeps the check marks it was built with. The
+    /// Settings field has no window to hand, which only matters for following the system on
+    /// platforms that report the appearance per window.
+    pub(crate) fn set_theme(
+        &mut self,
+        pref: Pref,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         if self.theme == pref {
             return;
         }
         self.theme = pref;
-        appearance::apply(pref, Some(window), cx);
+        appearance::apply(pref, window, cx);
         self.refresh_menus(cx);
         let path = self.appearance_file.clone();
         cx.background_spawn(async move { pref.save(&path) })
@@ -1524,6 +1596,24 @@ impl Console {
         });
     }
 
+    fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::settings::show(cx.weak_entity(), window, cx);
+    }
+
+    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, |dialog, _, _| {
+            dialog.title(format!("About {APP_NAME}")).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_sm()
+                    .child(concat!("Version ", env!("CARGO_PKG_VERSION")))
+                    .child("An Elasticsearch REST console with Query DSL completion."),
+            )
+        });
+    }
+
     /// Re-reads the nodes, templates, tasks and pipelines.
     fn load_catalog(&mut self, cx: &mut Context<Self>) {
         let Some(http) = self.http.clone() else {
@@ -1734,11 +1824,16 @@ impl Console {
         TitleBar::new()
             .bg(surfaces.ground)
             .border_0()
-            .child(self.menu_bar.clone())
+            // macOS draws the menus in the screen's menu bar; a second copy here would repeat
+            // every command inside the window. There the menu bar is also what pushes the
+            // commands to the right end, so a spacer takes its place.
+            .when(!cfg!(target_os = "macos"), |this| {
+                this.child(self.menu_bar.clone())
+            })
+            .when(cfg!(target_os = "macos"), |this| this.child(div().flex_1()))
             .child(self.render_toolbar(cx))
             .child(
                 div()
-                    .flex_1()
                     .flex()
                     .justify_end()
                     .text_sm()
@@ -2400,13 +2495,13 @@ impl Render for Console {
             }))
             .on_action(cx.listener(|this, _: &ToggleReadonly, _, cx| this.toggle_readonly(cx)))
             .on_action(cx.listener(|this, _: &UseSystemAppearance, window, cx| {
-                this.set_theme(Pref::System, window, cx)
+                this.set_theme(Pref::System, Some(window), cx)
             }))
             .on_action(cx.listener(|this, _: &UseLightAppearance, window, cx| {
-                this.set_theme(Pref::Light, window, cx)
+                this.set_theme(Pref::Light, Some(window), cx)
             }))
             .on_action(cx.listener(|this, _: &UseDarkAppearance, window, cx| {
-                this.set_theme(Pref::Dark, window, cx)
+                this.set_theme(Pref::Dark, Some(window), cx)
             }))
             .on_action(
                 cx.listener(|this, _: &ShowHistory, window, cx| this.show_history(window, cx)),
@@ -2414,6 +2509,11 @@ impl Render for Console {
             .on_action(
                 cx.listener(|this, _: &ShowShortcuts, window, cx| this.show_help(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.show_settings(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ShowAbout, window, cx| this.show_about(window, cx)))
+            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
             .child(self.render_titlebar(surfaces, cx))
             .child(
                 // The tree keeps its width: a drag on another handle never takes space from it. Panels clip their content and the editors do not wrap, so a narrower panel
@@ -3221,10 +3321,21 @@ mod tests {
     }
 
     fn console_window(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<Console>) {
+        // Under the temp directory so the appearance choice this test saves stays out of the repo.
+        console_window_at(
+            cx,
+            std::env::temp_dir().join("esdeck-test-connections.json"),
+        )
+    }
+
+    /// A console whose choices are written beside `connections`, so a test that changes them
+    /// does not race the other tests over one file.
+    fn console_window_at(
+        cx: &mut TestAppContext,
+        connections: PathBuf,
+    ) -> (gpui_kit::AnyWindowHandle, Entity<Console>) {
         cx.update(gpui_kit::init);
         let client = LspClient::start(sample_index(), None, es_dsl_core::NoFields).unwrap();
-        // Under the temp directory so the appearance choice this test saves stays out of the repo.
-        let connections = std::env::temp_dir().join("esdeck-test-connections.json");
         cx.update(|cx| {
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
                 let library = cx.new(|_| Library::blank());
@@ -3477,7 +3588,7 @@ mod tests {
         let path = cx.update(|cx| console.read(cx).appearance_file.clone());
         let choose = |cx: &mut TestAppContext, pref: Pref| {
             cx.update_window(window, |_, window, cx| {
-                console.update(cx, |this, cx| this.set_theme(pref, window, cx));
+                console.update(cx, |this, cx| this.set_theme(pref, Some(window), cx));
             })
             .unwrap();
             cx.run_until_parked();
@@ -3497,6 +3608,85 @@ mod tests {
             Pref::Light | Pref::System => ThemeMode::Light,
             Pref::Dark => ThemeMode::Dark,
         }
+    }
+
+    /// Settings opens from its command, reads the console's current choice, and writes the next
+    /// one through the console — the same path the View menu takes.
+    #[gpui_kit::test]
+    fn the_settings_dialog_changes_the_appearance(cx: &mut TestAppContext) {
+        // A directory of its own: the appearance file sits beside the connections file, and the
+        // shared one belongs to the test that asserts what was written.
+        let dir = std::env::temp_dir().join(format!("esdeck-settings-{}", std::process::id()));
+        // A reused process id must not bring an earlier run's choice back.
+        let _ = std::fs::remove_dir_all(&dir);
+        let (window, console) = console_window_at(cx, dir.join("connections.json"));
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            // Dispatch starts at the focused node; without one nothing bubbles.
+            editor.update(cx, |state, cx| state.focus(window, cx));
+            window.render_frame(cx);
+            // The command the menu item and the shortcut both dispatch.
+            window.dispatch_action(Box::new(OpenSettings), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find_by_label("Theme: Follow system").is_some(),
+                "the field shows the console's choice"
+            );
+            // The field's dropdown button; the page has only this one.
+            window.click("btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // System, Light, Dark: the third item is Dark.
+        cx.simulate_keystrokes(window, "down down down enter");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(console.read(cx).appearance(), Pref::Dark);
+            assert_eq!(cx.theme().mode, ThemeMode::Dark);
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find_by_label("Theme: Dark").is_some(),
+                "the dialog follows the change it made"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The native menu starts with the application menu, so the command menus keep their titles.
+    /// Settings lives in the application menu; a second copy in View would duplicate it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_menu_bar_starts_with_the_application_menu() {
+        fn actions(menu: &Menu) -> Vec<String> {
+            menu.items
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let menus = platform_menus(Pref::System, false);
+        let names: Vec<_> = menus.iter().map(|menu| menu.name.to_string()).collect();
+        assert_eq!(names, [APP_NAME, "View", "Help"]);
+        let app = actions(&menus[0]);
+        assert!(app.iter().any(|name| name == "About elasticsearch-deck"));
+        assert!(app.iter().any(|name| name == "Settings…"));
+        assert!(app.iter().any(|name| name == "Quit elasticsearch-deck"));
+        let view = actions(&menus[1]);
+        assert!(
+            view.iter().any(|name| name == "Send"),
+            "the request commands keep a menu home"
+        );
+        assert!(!view.iter().any(|name| name == "Settings…"));
     }
 
     /// An example in the empty response pane fills the editor and moves the cursor to the end, so
