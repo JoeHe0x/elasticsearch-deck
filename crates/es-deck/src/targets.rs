@@ -10,6 +10,8 @@ use gpui_kit::{
     Window, div, rems,
 };
 
+use gpui_kit::actions;
+
 use crate::connect::row_id;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +72,16 @@ impl Folder {
     }
 }
 
-/// What the right-click menu of a console row asks for.
+actions!(targets, [OpenInDataBrowser, OpenInRestConsole]);
+
+/// What the right-click menu of a row asks for.
 #[derive(Debug, Clone, Copy)]
 pub enum ConsoleOp {
     Rename,
     Delete,
+    /// Index and alias rows only.
+    OpenBrowser,
+    OpenConsole,
 }
 
 /// Called with the operation and the console's name; the owner of the tree performs it.
@@ -346,6 +353,42 @@ impl ListDelegate for Targets {
                     );
                 let entry = item(("tree-item", id as usize));
                 match (&self.menu, FOLDERS[slot]) {
+                    (Some(menu), Folder::Indices | Folder::Aliases) => {
+                        let menu = menu.clone();
+                        entry.child(inner.id(("tree-target", id as usize)).context_menu(
+                            move |popup, _, _| {
+                                let (browser, console) = (menu.clone(), menu.clone());
+                                let (browser_name, console_name) = (label.clone(), label.clone());
+                                popup
+                                    .item(
+                                        PopupMenuItem::new("Open in Data Browser")
+                                            .icon(IconName::Table2)
+                                            .action(Box::new(OpenInDataBrowser))
+                                            .on_click(move |_, window, cx| {
+                                                browser(
+                                                    ConsoleOp::OpenBrowser,
+                                                    browser_name.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            }),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new("Open in REST Console")
+                                            .icon(IconName::SquareTerminal)
+                                            .action(Box::new(OpenInRestConsole))
+                                            .on_click(move |_, window, cx| {
+                                                console(
+                                                    ConsoleOp::OpenConsole,
+                                                    console_name.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            }),
+                                    )
+                            },
+                        ))
+                    }
                     (Some(menu), Folder::Consoles) if label != es_client::saved::AUTO_CONSOLE => {
                         let menu = menu.clone();
                         entry.child(inner.id(("tree-console", id as usize)).context_menu(

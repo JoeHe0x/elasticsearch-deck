@@ -237,7 +237,7 @@ prefixes, in-memory LSP end-to-end tests and GPUI Kit headless editor tests.
 - [`docs/PRD.md`](docs/PRD.md) — product requirements (Chinese)
 - [`docs/m0-findings.md`](docs/m0-findings.md) — prototype findings, verified APIs and known gaps
   (Chinese)
-- [`docs/data-browser.md`](docs/data-browser.md) — Data Browser design, **not implemented yet**
+- [`docs/data-browser.md`](docs/data-browser.md) — Data Browser design; first version implemented, not yet production-grade
   (Chinese)
 - [`docs/gpui-kit.md`](docs/gpui-kit.md) — GPUI Kit development rules (Chinese)
 

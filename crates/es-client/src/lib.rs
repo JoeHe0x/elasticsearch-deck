@@ -3,6 +3,7 @@
 //! The client owns a small tokio runtime so callers may await from any executor. Every call returns
 //! a [`Task`]; dropping it or calling [`Task::abort`] cancels the in-flight request.
 
+pub mod browse;
 pub mod catalog;
 pub mod connection;
 pub mod history;
@@ -13,7 +14,7 @@ pub mod saved;
 mod store;
 pub use connection::{AuthKind, Connection, Keychain, Secrets};
 
-pub use hits::{Hits, parse_hits};
+pub use hits::{CellKind, Hits, parse_hits};
 pub use json_tree::{Node, json_tree};
 pub use meta::ClusterMeta;
 

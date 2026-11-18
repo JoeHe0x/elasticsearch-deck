@@ -20,6 +20,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+httpmock = "0.9"
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"

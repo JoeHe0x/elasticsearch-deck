@@ -219,7 +219,7 @@ GPUI Kit 无头编辑器测试。
 
 - [`docs/PRD.md`](docs/PRD.md) — 产品需求（中文）
 - [`docs/m0-findings.md`](docs/m0-findings.md) — 原型验证结论、已验证的 API 和已知缺口（中文）
-- [`docs/data-browser.md`](docs/data-browser.md) — Data Browser 设计，**尚未实现**（中文）
+- [`docs/data-browser.md`](docs/data-browser.md) — Data Browser 设计；首版已实现，尚未达到产品水准（中文）
 - [`docs/gpui-kit.md`](docs/gpui-kit.md) — GPUI Kit 开发规则（中文）
 
 ## 平台状态

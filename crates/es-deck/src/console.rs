@@ -28,7 +28,7 @@ use gpui_kit::component::menu::{
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::table::TableState;
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, GlobalState, Selectable as _, Sizable as _, WindowExt as _,
@@ -43,13 +43,16 @@ use gpui_kit::{
 use crate::appearance::{self, Pref};
 use crate::completion::{LspCompletion, LspHover};
 use crate::connect::{ConnectPanel, Connected, row_id};
+use crate::data_browser::DataBrowser;
 use crate::history_list::HistoryList;
-use crate::hits_table::HitsTable;
+use crate::hits_table::{self, HitsTable};
 use crate::library::{Changed, Library};
 use crate::lsp_client::LspClient;
 use crate::paint::Paint;
 use crate::schema_source;
-use crate::targets::{ConsoleOp, Folder, Row, Targets, search_text};
+use crate::targets::{
+    ConsoleOp, Folder, OpenInDataBrowser, OpenInRestConsole, Row, Targets, search_text,
+};
 use es_dsl_core::Token;
 
 /// How often a connected console re-reads cluster metadata for targets it has not seen yet.
@@ -138,11 +141,18 @@ pub fn bind_keys(cx: &mut App) {
             ShowCompletions,
             Some("Input && mode == editor"),
         ),
+        KeyBinding::new(OPEN_BROWSER_KEY, OpenInDataBrowser, Some("List")),
+        KeyBinding::new(SEND_KEY, OpenInRestConsole, Some("List")),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
         KeyBinding::new(CLOSE_TAB_KEY, CloseTab, None),
     ]);
 }
+
+#[cfg(target_os = "macos")]
+const OPEN_BROWSER_KEY: &str = "cmd-down";
+#[cfg(not(target_os = "macos"))]
+const OPEN_BROWSER_KEY: &str = "ctrl-down";
 
 #[cfg(target_os = "macos")]
 const SEND_KEY: &str = "cmd-enter";
@@ -206,6 +216,13 @@ struct TreePalette {
     keyword: Hsla,
     muted: Hsla,
     guide: Hsla,
+}
+
+/// Marks a tab key as a Data Browser's, so it cannot equal the name of a saved console.
+const BROWSER_PREFIX: &str = "table:";
+
+fn browser_key(target: &str) -> String {
+    format!("{BROWSER_PREFIX}{target}")
 }
 
 /// The response area of a tab that is not shown, kept so switching back finds it as it was.
@@ -286,6 +303,8 @@ pub struct Console {
     active: String,
     /// The response area of every tab but the active one, by console name.
     panes: HashMap<String, Pane>,
+    /// The Data Browser tabs, by tab key (see [`browser_key`]); each is also in `tabs`.
+    browsers: HashMap<String, Entity<DataBrowser>>,
     /// The consoles shown as tabs above the editor, in opening order; `active` is one of them.
     tabs: Vec<String>,
     paint: Paint,
@@ -385,6 +404,8 @@ impl Console {
                     let _ = owner.update(cx, |this, cx| match op {
                         ConsoleOp::Rename => this.rename_console(name, window, cx),
                         ConsoleOp::Delete => this.delete_console(name, cx),
+                        ConsoleOp::OpenBrowser => this.open_browser(name, cx),
+                        ConsoleOp::OpenConsole => this.open_named(name, cx),
                     });
                 }));
         });
@@ -408,7 +429,7 @@ impl Console {
                         // A single click only selects; the second one opens the object's console.
                         Folder::Indices | Folder::Aliases => {
                             if double {
-                                this.open_named(label, cx);
+                                this.open_browser(label, cx);
                             }
                         }
                         _ => this.append_request(text, false, cx),
@@ -490,6 +511,7 @@ impl Console {
             schema_load: None,
             active: saved::AUTO_CONSOLE.into(),
             panes: HashMap::new(),
+            browsers: HashMap::new(),
             tabs: vec![saved::AUTO_CONSOLE.into()],
             paint,
             response_paint,
@@ -581,6 +603,10 @@ impl Console {
 
     /// Runs the request under the cursor; a request already in flight is cancelled first.
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The filter box of a Data Browser shares the key context; its keys are not console keys.
+        if self.browsers.contains_key(&self.active) {
+            return;
+        }
         let Some(http) = self.http.clone() else {
             self.fail("Not connected. Choose a connection first.", cx);
             return;
@@ -717,6 +743,9 @@ impl Console {
 
     /// Re-indents the JSON body of the request under the cursor; one undo step reverts it.
     fn format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browsers.contains_key(&self.active) {
+            return;
+        }
         let editor = self.editor.clone();
         editor.update(cx, |state, cx| {
             let text = state.value().to_string();
@@ -855,11 +884,63 @@ impl Console {
         self.open_console(name, text, cx);
     }
 
+    /// The index or alias selected in the tree, for the keyboard shortcuts.
+    fn selected_target(&self, cx: &Context<Self>) -> Option<String> {
+        let list = self.targets.read(cx);
+        match list.delegate().selected()? {
+            (Folder::Indices | Folder::Aliases, row) => Some(row.label.clone()),
+            _ => None,
+        }
+    }
+
+    /// Opens the Data Browser of an index or alias, or switches to the one already open.
+    fn open_browser(&mut self, target: String, cx: &mut Context<Self>) {
+        let key = browser_key(&target);
+        if self.browsers.contains_key(&key) {
+            self.activate_browser(key, cx);
+            return;
+        }
+        let (Some(http), Some(window)) = (self.http.clone(), cx.active_window()) else {
+            return;
+        };
+        let meta = self.meta.clone();
+        // Opened from a list click, the window is busy with that event; see `open_console`.
+        cx.spawn(async move |this, cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    let browser = cx.new(|cx| DataBrowser::new(target, http, meta, window, cx));
+                    this.browsers.insert(key.clone(), browser);
+                    this.activate_browser(key, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Makes the Data Browser tab `key` the shown one; the console it replaces is saved and parked.
+    fn activate_browser(&mut self, key: String, cx: &mut Context<Self>) {
+        self.save_active(cx);
+        if !self.tabs.contains(&key) {
+            self.tabs.push(key.clone());
+        }
+        // A check still waiting would save the editor text under the new name.
+        self.lint = None;
+        let leaving = std::mem::replace(&mut self.active, key.clone());
+        if leaving != key {
+            self.swap_pane(leaving, &key, cx);
+        }
+        cx.notify();
+    }
+
     /// Switches to the tab at `ix`, loading its saved text.
     fn select_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(name) = self.tabs.get(ix).cloned() else {
             return;
         };
+        if self.browsers.contains_key(&name) {
+            self.activate_browser(name, cx);
+            return;
+        }
         // Consoles are stored per connection; with none there is no text to load, and reloading
         // would clear the draft still in the editor.
         if self.summary.is_none() {
@@ -880,7 +961,10 @@ impl Console {
         }
         let closed_active = self.tabs[ix] == self.active;
         self.save_active(cx);
-        self.tabs.remove(ix);
+        let closed = self.tabs.remove(ix);
+        if self.browsers.remove(&closed).is_some() {
+            self.panes.remove(&closed);
+        }
         if closed_active {
             self.select_tab(ix.saturating_sub(1), cx);
         } else {
@@ -988,10 +1072,12 @@ impl Console {
             .px_1()
             .overflow_x_hidden()
             .children(self.tabs.iter().enumerate().map(|(ix, name)| {
+                let browsing = self.browsers.contains_key(name);
+                let shown = name.strip_prefix(BROWSER_PREFIX).unwrap_or(name);
                 let label = if conn.is_empty() {
-                    name.clone()
+                    shown.to_string()
                 } else {
-                    format!("{name} [{conn}]")
+                    format!("{shown} [{conn}]")
                 };
                 let tab = div()
                     .id(("console-tab", row_id(name)))
@@ -1008,9 +1094,13 @@ impl Console {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.select_tab(ix, cx)))
                     .child(
-                        Icon::new(IconName::SquareTerminal)
-                            .small()
-                            .text_color(muted),
+                        Icon::new(if browsing {
+                            IconName::Table2
+                        } else {
+                            IconName::SquareTerminal
+                        })
+                        .small()
+                        .text_color(muted),
                     )
                     .child(div().whitespace_nowrap().child(SharedString::from(label)));
                 let tab = if *name == self.active {
@@ -1038,8 +1128,9 @@ impl Console {
                         }))
                         .child(Icon::new(IconName::Close).size_3())
                 }));
-                // The default console can be neither renamed nor deleted, so it has no menu.
-                if name == saved::AUTO_CONSOLE {
+                // The default console can be neither renamed nor deleted, and a Data Browser is not
+                // a saved console, so neither has a menu.
+                if name == saved::AUTO_CONSOLE || browsing {
                     return tab.into_any_element();
                 }
                 tab.context_menu(move |menu, _, _| {
@@ -1063,7 +1154,9 @@ impl Console {
     fn save_active(&mut self, cx: &mut Context<Self>) {
         let (name, text) = (self.connection_name(), self.editor.read(cx).value());
         // Before a connection is chosen, or after the open console was deleted, there is none to keep.
-        if !name.is_empty() && !self.active.is_empty() {
+        // A Data Browser has no text; the editor still holds the console it replaced.
+        if !name.is_empty() && !self.active.is_empty() && !self.browsers.contains_key(&self.active)
+        {
             let active = self.active.clone();
             self.library.update(cx, |library, cx| {
                 library.set_console(&name, &active, &text, cx)
@@ -1313,6 +1406,7 @@ impl Console {
         self.tabs = vec![saved::AUTO_CONSOLE.into()];
         self.active = saved::AUTO_CONSOLE.into();
         self.panes.clear();
+        self.browsers.clear();
         (self.hits, self.tree, self.full_body) = (None, None, None);
         self.view = View::Json;
         self.targets.update(cx, |list, cx| {
@@ -1446,6 +1540,7 @@ impl Console {
         }
         self.tabs = vec![saved::AUTO_CONSOLE.into()];
         self.panes.clear();
+        self.browsers.clear();
         // Empty until `open_console` names the tab, so it does not save the old text under the
         // new connection.
         self.active.clear();
@@ -1996,7 +2091,7 @@ impl Console {
         if show_body {
             viewer = viewer.child(
                 div().flex_1().min_h_0().child(match (table, outline) {
-                    (Some(t), _) => DataTable::new(t).stripe(true).into_any_element(),
+                    (Some(t), _) => hits_table::view(t).into_any_element(),
                     (None, Some(t)) => tree(t, move |_, entry, selected, _, _| {
                         let chevron = if !entry.is_folder() {
                             None
@@ -2203,6 +2298,16 @@ impl Render for Console {
             .flex()
             .flex_col()
             .bg(ground)
+            .on_action(cx.listener(|this, _: &OpenInDataBrowser, _, cx| {
+                if let Some(name) = this.selected_target(cx) {
+                    this.open_browser(name, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenInRestConsole, _, cx| {
+                if let Some(name) = this.selected_target(cx) {
+                    this.open_named(name, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Format, window, cx| this.format(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| this.newline(window, cx)))
@@ -2252,77 +2357,111 @@ impl Render for Console {
                                     .flex()
                                     .flex_col()
                                     .child(self.render_tabs(cx))
-                                    .child(div().flex_1().min_h_0().child({
-                                        // Nothing to analyze yet: the editor keeps the height.
-                                        let layout = if response {
-                                            self.result_layout
-                                        } else {
-                                            ResultLayout::Split
-                                        };
-                                        let show_body = layout != ResultLayout::Collapsed;
-                                        let editor_card =
-                                            card().id("editor-card").test_support().p_1p5().child(
-                                                Editor::new(&self.editor).bordered(false).h_full(),
-                                            );
-                                        let content = if response {
-                                            self.render_response(cx, show_body).into_any_element()
-                                        } else if empty {
-                                            self.render_empty_response(cx).into_any_element()
-                                        } else {
-                                            div().into_any_element()
-                                        };
-                                        let response_card = card()
-                                            .id("result-card")
-                                            .test_support()
-                                            .p_2()
-                                            .child(content);
-                                        match layout {
-                                            // Stacked by default: a request is wider than it is tall, and the
-                                            // response beneath it keeps the full width for tables.
-                                            ResultLayout::Split => v_resizable("editor-split")
-                                                .with_state(&self.split)
-                                                .child(resizable_panel().child(editor_card))
-                                                .child(
-                                                    resizable_panel()
-                                                        .size_range(size(16.0)..size(120.0))
+                                    .child(
+                                        div().flex_1().min_h_0().child(
+                                            match self.browsers.get(&self.active) {
+                                                Some(browser) => card()
+                                                    .id("browser-card")
+                                                    .test_support()
+                                                    .p_1p5()
+                                                    .child(browser.clone())
+                                                    .into_any_element(),
+                                                None => {
+                                                    // Nothing to analyze yet: the editor keeps the height.
+                                                    let layout = if response {
+                                                        self.result_layout
+                                                    } else {
+                                                        ResultLayout::Split
+                                                    };
+                                                    let show_body =
+                                                        layout != ResultLayout::Collapsed;
+                                                    let editor_card = card()
+                                                        .id("editor-card")
+                                                        .test_support()
+                                                        .p_1p5()
                                                         .child(
-                                                            div()
-                                                                .size_full()
-                                                                .pt_0p5()
-                                                                .child(response_card),
-                                                        ),
-                                                )
-                                                .into_any_element(),
-                                            // Folded away: only the response's header row stays, at the
-                                            // bottom, so the editor owns the rest of the height. Its
-                                            // card must size to that row rather than to the whole column.
-                                            ResultLayout::Collapsed => div()
-                                                .size_full()
-                                                .flex()
-                                                .flex_col()
-                                                .child(div().flex_1().min_h_0().child(editor_card))
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .pt_0p5()
-                                                        .child(response_card.h_auto()),
-                                                )
-                                                .into_any_element(),
-                                            // The response alone, for reading the data.
-                                            ResultLayout::Maximized => div()
-                                                .size_full()
-                                                .flex()
-                                                .flex_col()
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_h_0()
-                                                        .pt_0p5()
-                                                        .child(response_card),
-                                                )
-                                                .into_any_element(),
-                                        }
-                                    })),
+                                                            Editor::new(&self.editor)
+                                                                .bordered(false)
+                                                                .h_full(),
+                                                        );
+                                                    let content = if response {
+                                                        self.render_response(cx, show_body)
+                                                            .into_any_element()
+                                                    } else if empty {
+                                                        self.render_empty_response(cx)
+                                                            .into_any_element()
+                                                    } else {
+                                                        div().into_any_element()
+                                                    };
+                                                    let response_card = card()
+                                                        .id("result-card")
+                                                        .test_support()
+                                                        .p_2()
+                                                        .child(content);
+                                                    match layout {
+                                                        // Stacked by default: a request is wider than it is tall, and the
+                                                        // response beneath it keeps the full width for tables.
+                                                        ResultLayout::Split => {
+                                                            v_resizable("editor-split")
+                                                                .with_state(&self.split)
+                                                                .child(
+                                                                    resizable_panel()
+                                                                        .child(editor_card),
+                                                                )
+                                                                .child(
+                                                                    resizable_panel()
+                                                                        .size_range(
+                                                                            size(16.0)..size(120.0),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .size_full()
+                                                                                .pt_0p5()
+                                                                                .child(
+                                                                                    response_card,
+                                                                                ),
+                                                                        ),
+                                                                )
+                                                                .into_any_element()
+                                                        }
+                                                        // Folded away: only the response's header row stays, at the
+                                                        // bottom, so the editor owns the rest of the height. Its
+                                                        // card must size to that row rather than to the whole column.
+                                                        ResultLayout::Collapsed => div()
+                                                            .size_full()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_h_0()
+                                                                    .child(editor_card),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_none()
+                                                                    .pt_0p5()
+                                                                    .child(response_card.h_auto()),
+                                                            )
+                                                            .into_any_element(),
+                                                        // The response alone, for reading the data.
+                                                        ResultLayout::Maximized => div()
+                                                            .size_full()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_h_0()
+                                                                    .pt_0p5()
+                                                                    .child(response_card),
+                                                            )
+                                                            .into_any_element(),
+                                                    }
+                                                }
+                                            },
+                                        ),
+                                    ),
                             ),
                         ),
                 ),
@@ -2639,7 +2778,9 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(window, |_, _, cx| {
-            console.update(cx, |this, cx| this.open_named("idx".into(), cx))
+            console.update(cx, |this, cx| {
+                this.open_console("idx".into(), search_text("idx"), cx)
+            })
         })
         .unwrap();
         cx.run_until_parked();

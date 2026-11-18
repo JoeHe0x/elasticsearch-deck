@@ -14,6 +14,7 @@ icon_assets!(
         CircleDot,
         CircleQuestionMark,
         Clock,
+        Columns3,
         Copy,
         Database,
         Download,
@@ -74,6 +75,7 @@ mod tests {
             IconName::ChevronUp,
             IconName::Maximize,
             IconName::Minimize,
+            IconName::Columns3,
         ] {
             let path = name.path();
             assert!(

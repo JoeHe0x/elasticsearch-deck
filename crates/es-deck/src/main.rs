@@ -6,6 +6,7 @@ mod assets;
 mod completion;
 mod connect;
 mod console;
+mod data_browser;
 mod history_list;
 mod hits_table;
 mod library;

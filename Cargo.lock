@@ -1810,6 +1810,7 @@ dependencies = [
  "es-dsl-lsp",
  "futures",
  "gpui-kit",
+ "httpmock",
  "lsp-server",
  "lsp-types",
  "serde",

@@ -1,7 +1,10 @@
 //! Bridges the GPUI Kit editor's completion and hover providers to the in-process LSP client.
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
+
+use es_dsl_core::Field;
 
 use anyhow::Result;
 use gpui_kit::component::Rope;
@@ -74,6 +77,63 @@ impl CompletionProvider for LspCompletion {
     }
 }
 
+/// Completes field names in the Data Browser's filter box, with the mapping type as the detail.
+pub struct FieldCompletion(pub Rc<dyn Fn() -> Arc<[Field]>>);
+
+/// Start of the field-name word that ends at `offset`, or `None` when the caret is in a value
+/// (after `:` or a comparison operator) or inside quotes.
+fn field_word(before: &str) -> Option<usize> {
+    let start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '@')))
+        .map_or(0, |i| {
+            i + before[i..].chars().next().map_or(1, char::len_utf8)
+        });
+    let prev = before[..start].trim_end().chars().next_back();
+    let quoted = before.matches('"').count() % 2 == 1;
+    (!quoted && !matches!(prev, Some(':' | '<' | '>' | '='))).then_some(start)
+}
+
+impl CompletionProvider for FieldCompletion {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _trigger: CompletionContext,
+        _window: &mut gpui_kit::Window,
+        _cx: &mut App,
+    ) -> Task<Result<CompletionResponse>> {
+        let before = text.to_string();
+        let before = before.get(..offset).unwrap_or_default();
+        let Some(start) = field_word(before) else {
+            return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
+        };
+        let typed = &before[start..];
+        let range = lsp_types::Range::new(
+            text.offset_to_position(start),
+            text.offset_to_position(offset),
+        );
+        let items = (self.0)()
+            .iter()
+            .filter(|f| !f.nested)
+            .map(|f| CompletionItem {
+                label: f.name.clone(),
+                detail: Some(f.ty.clone()),
+                kind: Some(lsp_types::CompletionItemKind::FIELD),
+                text_edit: Some(lsp_types::CompletionTextEdit::Edit(
+                    lsp_types::TextEdit::new(range, f.name.clone()),
+                )),
+                ..Default::default()
+            })
+            .filter(|i| typed.is_empty() || !highlight_subsequence(typed, i).is_empty())
+            .collect();
+        Task::ready(Ok(CompletionResponse::Array(items)))
+    }
+
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
+        new_text.chars().any(is_trigger_char)
+    }
+}
+
 pub struct LspHover(pub Arc<LspClient>);
 
 impl HoverProvider for LspHover {
@@ -94,6 +154,19 @@ impl HoverProvider for LspHover {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_names_are_offered_only_outside_values_and_quotes() {
+        assert_eq!(
+            field_word("Title : S* and IMDB_Rating > 7.5 and c"),
+            Some(37)
+        );
+        assert_eq!(field_word(""), Some(0));
+        assert_eq!(field_word("a:"), None);
+        assert_eq!(field_word("a > 7"), None);
+        assert_eq!(field_word("a : \"why c"), None);
+        assert_eq!(field_word("(a:1 or "), Some(8));
+    }
 
     #[test]
     fn structure_and_whitespace_do_not_trigger() {
