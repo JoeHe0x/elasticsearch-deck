@@ -1093,6 +1093,7 @@ impl Console {
             let Ok(Ok(Some(path))) = asked.await else {
                 return;
             };
+            let path = Self::json_extension(path);
             let written = cx
                 .background_spawn(async move { std::fs::write(&path, body) })
                 .await;
@@ -1104,6 +1105,17 @@ impl Console {
             }
         })
         .detach();
+    }
+
+    /// The save panel keeps the name as typed, so a name without an extension would write a JSON
+    /// file that neither the file manager nor other tools recognize. A name the user chose is
+    /// left alone.
+    fn json_extension(path: PathBuf) -> PathBuf {
+        if path.extension().is_none_or(|e| e.is_empty()) {
+            path.with_extension("json")
+        } else {
+            path
+        }
     }
 
     fn copy_path(&mut self, cx: &mut Context<Self>) {
@@ -5078,6 +5090,24 @@ mod tests {
             "the request commands keep a menu home"
         );
         assert!(!view.iter().any(|name| name == "Settings…"));
+    }
+
+    /// A response saved under a name without an extension is still a JSON file; one the user
+    /// named (`.json`, `.txt`, anything) is left as typed.
+    #[test]
+    fn a_saved_response_gains_a_json_extension_only_when_it_has_none() {
+        for (typed, saved) in [
+            ("/tmp/response", "/tmp/response.json"),
+            ("/tmp/response.", "/tmp/response.json"),
+            ("/tmp/response.json", "/tmp/response.json"),
+            ("/tmp/body.txt", "/tmp/body.txt"),
+        ] {
+            assert_eq!(
+                Console::json_extension(PathBuf::from(typed)),
+                PathBuf::from(saved),
+                "{typed}"
+            );
+        }
     }
 
     /// The result table sorts the rows the response brought, hides columns and opens a row's
