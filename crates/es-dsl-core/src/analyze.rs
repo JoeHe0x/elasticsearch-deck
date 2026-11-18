@@ -10,7 +10,7 @@ use crate::candidate::describe;
 use crate::complete::{Root, body_root, match_endpoint, resolve};
 use crate::request::{Block, split_blocks};
 use crate::schema::visible;
-use crate::{Endpoint, Index, Prop, Seg, TypeRef, Version, keys};
+use crate::{Endpoint, Index, Prop, Seg, Token, TypeRef, Version, keys};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -137,6 +137,35 @@ fn units<'a>(text: &str, block: &Block, endpoint: &'a Endpoint) -> Vec<Unit<'a>>
             })
         })
         .collect()
+}
+
+/// Classifies object keys by the schema: `Property` for keywords the DSL declares, `Field` for names
+/// the user chose (a field under `match`, an aggregation name). Other keys are left out.
+pub fn key_tokens(
+    index: &Index,
+    text: &str,
+    version: Option<Version>,
+) -> Vec<(Range<usize>, Token)> {
+    let mut out = Vec::new();
+    for block in split_blocks(text) {
+        let Some(endpoint) = match_endpoint(index, &block.method, &block.path, version) else {
+            continue;
+        };
+        for unit in units(text, &block, endpoint) {
+            for tok in keys(&unit.text) {
+                let l = Lookup::of(index, &unit.root, &tok.parent, &tok.name, version);
+                let kind = if !l.props.is_empty() {
+                    Token::Property
+                } else if l.open {
+                    Token::Field
+                } else {
+                    continue;
+                };
+                out.push((unit.base + tok.range.start..unit.base + tok.range.end, kind));
+            }
+        }
+    }
+    out
 }
 
 /// Everything wrong that can be told without a cluster.

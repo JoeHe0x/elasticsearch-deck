@@ -8,9 +8,16 @@ use crate::request::{METHODS, split_blocks};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Token {
     Method,
-    Path,
+    /// An index, alias or id in the path.
+    Target,
+    /// An API segment of the path, such as `_search`.
+    Endpoint,
     Query,
     Key,
+    /// An object key the schema declares (`query`, `match_all`); only schema-aware callers know.
+    Property,
+    /// An object key the user chose (field or aggregation name); only schema-aware callers know.
+    Field,
     String,
     Number,
     Keyword,
@@ -23,6 +30,13 @@ pub fn tokens(text: &str) -> Vec<(Range<usize>, Token)> {
         request_line(text, block.line.clone(), &mut out);
         body(text, block.body, &mut out);
     }
+    out
+}
+
+/// Spans of a buffer that is plain JSON, such as a response body.
+pub fn json_tokens(text: &str) -> Vec<(Range<usize>, Token)> {
+    let mut out = Vec::new();
+    body(text, 0..text.len(), &mut out);
     out
 }
 
@@ -57,7 +71,18 @@ fn request_line(text: &str, line: Range<usize>, out: &mut Vec<(Range<usize>, Tok
     let split = text[path_start..end]
         .find('?')
         .map_or(end, |q| path_start + q);
-    out.push((path_start..split, Token::Path));
+    let mut at = path_start;
+    for seg in text[path_start..split].split('/') {
+        if !seg.is_empty() {
+            let token = if seg.starts_with('_') {
+                Token::Endpoint
+            } else {
+                Token::Target
+            };
+            out.push((at..at + seg.len(), token));
+        }
+        at += seg.len() + 1;
+    }
     if split < end {
         out.push((split..end, Token::Query));
     }
@@ -122,7 +147,8 @@ mod tests {
             classes(text),
             [
                 ("GET", Token::Method),
-                ("idx/_search", Token::Path),
+                ("idx", Token::Target),
+                ("_search", Token::Endpoint),
                 ("?size=1", Token::Query),
                 ("\"q\"", Token::Key),
                 ("1", Token::Number),
@@ -157,7 +183,7 @@ mod tests {
             classes("POST x\n{\"a"),
             [
                 ("POST", Token::Method),
-                ("x", Token::Path),
+                ("x", Token::Target),
                 ("\"a", Token::String)
             ]
         );

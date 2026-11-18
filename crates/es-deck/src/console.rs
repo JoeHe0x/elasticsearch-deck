@@ -50,6 +50,7 @@ use crate::lsp_client::LspClient;
 use crate::paint::Paint;
 use crate::schema_source;
 use crate::targets::{ConsoleOp, Folder, Row, Targets, search_text};
+use es_dsl_core::Token;
 
 /// How often a connected console re-reads cluster metadata for targets it has not seen yet.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
@@ -263,7 +264,7 @@ pub struct Console {
     run: Run,
     /// The in-flight request; dropping it aborts the call.
     sending: Option<Task<()>>,
-    index: Index,
+    index: Arc<Index>,
     client: Arc<LspClient>,
     /// Whether the last metadata refresh reached the cluster; drives the tree's status dot.
     online: bool,
@@ -288,6 +289,8 @@ pub struct Console {
     /// The consoles shown as tabs above the editor, in opening order; `active` is one of them.
     tabs: Vec<String>,
     paint: Paint,
+    /// Colors of the response editor's JSON.
+    response_paint: Paint,
     menu_bar: Entity<AppMenuBar>,
 }
 
@@ -340,7 +343,7 @@ impl Console {
             .detach();
         })
         .detach();
-        let paint = Paint::new(&editor, cx);
+        let paint = Paint::new(&editor, false, cx);
         paint.refresh(text, cx);
         // Any editor notification may be a cursor move, so what depends on the cursor is recomputed
         // and compared; setting a decoration notifies the editor again.
@@ -366,6 +369,14 @@ impl Console {
                 .language("json")
                 .soft_wrap(false)
         });
+        let response_paint = Paint::new(&response, true, cx);
+        cx.subscribe(&response, |this, response, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                let text = response.read(cx).value().to_string();
+                this.response_paint.refresh(&text, cx);
+            }
+        })
+        .detach();
         let targets = cx.new(|cx| ListState::new(Targets::default(), window, cx));
         let owner = cx.weak_entity();
         targets.update(cx, |list, _| {
@@ -467,7 +478,7 @@ impl Console {
             active_block: None,
             run: Run::Idle,
             sending: None,
-            index,
+            index: Arc::new(index),
             client,
             online: false,
             sidebar_open: true,
@@ -481,6 +492,7 @@ impl Console {
             panes: HashMap::new(),
             tabs: vec![saved::AUTO_CONSOLE.into()],
             paint,
+            response_paint,
             menu_bar: AppMenuBar::new(cx),
         }
     }
@@ -520,7 +532,10 @@ impl Console {
     fn lint(&mut self, cx: &mut Context<Self>) {
         // Every text change, typed or set by code, ends up here, so the colors are redone too.
         let text = self.editor.read(cx).value().to_string();
-        self.paint.refresh(&text, cx);
+        // Classified on the spot, not after the lint delay: keys would otherwise show the default
+        // color first and change once the schema pass lands.
+        let keys = es_dsl_core::key_tokens(&self.index, &text, None);
+        self.paint.set_custom(&text, keys, cx);
         self.lint = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(LINT_DELAY).await;
             let Ok((text, client)) = this.update(cx, |this, cx| {
@@ -1401,9 +1416,11 @@ impl Console {
         fields: es_client::ClusterMeta,
         cx: &mut Context<Self>,
     ) {
-        let Ok(client) = LspClient::start(index, Some(version), fields) else {
+        let shared = Arc::new(index);
+        let Ok(client) = LspClient::start(Index::clone(&shared), Some(version), fields) else {
             return;
         };
+        self.index = shared;
         self.client = client.clone();
         self.editor.update(cx, |state, _| install(state, &client));
         self.lint(cx);
@@ -1447,7 +1464,11 @@ impl Console {
 
     /// Restarts completion against the cluster that just answered, and keeps its metadata fresh.
     fn connected(&mut self, done: &Connected, cx: &mut Context<Self>) {
-        let started = LspClient::start(self.index.clone(), Some(done.version), done.meta.clone());
+        let started = LspClient::start(
+            Index::clone(&self.index),
+            Some(done.version),
+            done.meta.clone(),
+        );
         let Ok(client) = started else { return };
         let text = self.switch_to(done, cx);
         self.client = client.clone();
@@ -1867,10 +1888,10 @@ impl Console {
     fn render_response(&self, cx: &mut Context<Self>, show_body: bool) -> impl IntoElement {
         let theme = cx.theme();
         let palette = TreePalette {
-            key: theme.blue,
-            string: theme.green,
-            number: theme.yellow,
-            keyword: theme.magenta,
+            key: crate::paint::color(Token::Key, theme.is_dark()),
+            string: crate::paint::color(Token::String, theme.is_dark()),
+            number: crate::paint::color(Token::Number, theme.is_dark()),
+            keyword: crate::paint::color(Token::Keyword, theme.is_dark()),
             muted: theme.muted_foreground,
             guide: theme.border,
         };

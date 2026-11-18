@@ -257,6 +257,7 @@ impl ListDelegate for Targets {
         let (muted, radius) = (theme.muted_foreground, theme.radius);
         // Painted on the inner row, not the item: the item's hover color would otherwise cover it
         // right after a click, when the pointer is still on the row.
+        let (theme_green, theme_magenta, theme_blue) = (theme.green, theme.magenta, theme.blue);
         let selected = theme.blue.opacity(0.16);
         let chosen = self.selected == Some(ix);
         let line = *self.lines.get(ix.row)?;
@@ -327,7 +328,15 @@ impl ListDelegate for Targets {
                             FOLDERS[slot].icon()
                         })
                         .small()
-                        .text_color(muted),
+                        // Open indices green, aliases purple, closed ones dimmed: the two folders
+                        // list similar names, so the icon color is what tells them apart.
+                        .text_color(match (closed, FOLDERS[slot]) {
+                            (true, _) => muted,
+                            (_, Folder::Indices) => theme_green,
+                            (_, Folder::Aliases) => theme_magenta,
+                            (_, Folder::Consoles) => theme_blue,
+                            _ => muted,
+                        }),
                     )
                     .child(
                         div()
