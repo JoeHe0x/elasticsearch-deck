@@ -361,8 +361,6 @@ pub struct Console {
     online: bool,
     /// Whether the tree panel is shown.
     sidebar_open: bool,
-    /// Whether the tree's filter input is shown; hidden, it filters nothing.
-    filter_open: bool,
     /// The connected cluster's completion cache, kept for the tree's refresh button.
     meta: Option<es_client::ClusterMeta>,
     /// Dropping it stops refreshing for the previous connection.
@@ -484,7 +482,9 @@ impl Console {
             }
         })
         .detach();
-        let targets = cx.new(|cx| ListState::new(Targets::default(), window, cx));
+        // The filter is a fixed field at the top of the tree, not a search mode behind an icon:
+        // filtering is frequent enough that hiding its box behind a toggle costs a click a time.
+        let targets = cx.new(|cx| ListState::new(Targets::default(), window, cx).searchable(true));
         let owner = cx.weak_entity();
         targets.update(cx, |list, _| {
             list.delegate_mut()
@@ -639,7 +639,6 @@ impl Console {
             client,
             online: false,
             sidebar_open: true,
-            filter_open: false,
             meta: None,
             refresh: None,
             lint: None,
@@ -2749,28 +2748,10 @@ impl Render for Console {
         let card = move || div().overflow_hidden().rounded(radius).bg(surfaces.panel);
         // The sidebar only exists while a connection is open. Its name and health are in the
         // title bar's connection crumb, so the tree begins with its commands, right-aligned on a
-        // full-width row that a divider separates from the list.
+        // full-width row; the list below keeps its filter field at the top at all times.
         // The tree's commands are a toolbar, not a bare row of buttons: the toolbar gives them
         // the Toolbar role and arrow-key focus between them, which a flex row does not.
         let actions = Toolbar::new("tree-toolbar")
-            .child(
-                tool("tree-filter", IconName::Search, "Filter the tree")
-                    .selected(self.filter_open)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.filter_open = !this.filter_open;
-                        let open = this.filter_open;
-                        this.targets.update(cx, |list, cx| {
-                            if !open {
-                                list.set_query("", window, cx);
-                            }
-                            list.set_searchable(open, cx);
-                            if open {
-                                list.focus(window, cx);
-                            }
-                        });
-                        cx.notify();
-                    })),
-            )
             .child(
                 tool("tree-refresh", IconName::RefreshCw, "Reload the tree").on_click(cx.listener(
                     move |this, _, _, cx| {
@@ -3620,8 +3601,9 @@ mod tests {
         });
     }
 
-    /// The tree's commands sit under the connection name as one toolbar: assistive technology
-    /// hears a toolbar, each icon-only button carries a name, and the arrow keys move along it.
+    /// The tree opens with its commands as one toolbar: assistive technology hears a toolbar,
+    /// each icon-only button carries a name, and the arrow keys move along it. The filter is a
+    /// field that is always there, not a search mode the toolbar would toggle on.
     #[gpui_kit::test]
     fn the_tree_commands_are_a_named_toolbar(cx: &mut TestAppContext) {
         let (window, console) = console_window(cx);
@@ -3655,16 +3637,20 @@ mod tests {
                 toggle.bounds().origin.x.as_f32(),
                 send.bounds().origin.x.as_f32()
             );
-            for label in ["Filter the tree", "Reload the tree", "Disconnect"] {
+            for label in ["Reload the tree", "Disconnect"] {
                 assert!(window.try_find_by_label(label).is_some(), "{label}");
             }
-            window.click("tree-filter", cx);
+            // The filter field is a permanent row of the tree, so it is focusable and named
+            // before the user asks for it.
+            assert!(
+                window.try_find_by_label("Filter").is_some(),
+                "the tree shows its filter field without a toggle"
+            );
         })
         .unwrap();
-        cx.update(|cx| assert!(console.read(cx).filter_open));
-        // The toolbar owns the arrow keys: from the last button they wrap to the first.
+        // The toolbar owns the arrow keys: from the first button they move to the next.
         cx.update_window(window, |_, window, cx| {
-            // Tab reaches the toolbar's buttons like any other control; stop on the middle one.
+            // Tab reaches the toolbar's buttons like any other control; stop on the first one.
             // A frame between steps matters: the tab order is built while painting.
             for _ in 0..80 {
                 window.focus_next(cx);
