@@ -2,7 +2,7 @@
 
 - 版本:v0.2 草案(v0.1 的产品名 EsDeck 已统一改为 elasticsearch-deck)
 - 日期:2026-11-12
-- 技术底座:GPUI Kit(Rust,gpui-component / gpui-base,官网标注版本 0.9.1)
+- 技术底座:GPUI Kit(Rust,gpui-component / gpui-base,当前固定版本 0.10.0)
 - 状态:待评审。标注【待验证】的条目依赖原型验证,不是已确认事实。
 - 命名:仓库与产品名 `elasticsearch-deck`;应用与构建 crate 前缀 `es-deck-`;引擎 crate 为 `es-dsl-*`、`es-client`。名称含 Elasticsearch 字样,正式发布前需核对 Elastic 的商标使用政策(未核实具体条款)。
 
@@ -70,7 +70,7 @@
 ### 3.2 技术风险(必须在原型阶段关闭)
 | 风险 | 说明 | 处置 |
 |---|---|---|
-| R1 版本不稳定 | 版本 0.9.x,底层 GPUI API 变动频繁 | 锁定版本与 rev;封装适配层,隔离框架 API |
+| R1 版本不稳定 | 版本 0.10.x,底层 GPUI API 变动频繁 | 锁定版本与 rev;封装适配层,隔离框架 API |
 | R2 中文输入法 | 自绘 UI 的 IME(预编辑、候选窗定位)表现未知 | 原型第 1 周验证;不通过则触发备选方案 |
 | R3 官网宣称未核实 | 如 "200K 行稳定"、虚拟表格性能 | 自建基准测试 |
 | R4 文档与社区 | 规模未核实 | 预留读源码时间 |

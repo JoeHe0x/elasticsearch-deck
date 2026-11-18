@@ -26,7 +26,8 @@ Not verified: how `inherits`/`attachedBehaviors` must be merged into a request's
 
 ## Prior-art survey (library-first)
 
-Checked 2026-11-12 via crates.io API, `gh api`, and the published `gpui-component` / `gpui-base` 0.9.1 sources.
+Checked 2026-11-12 via crates.io API, `gh api`, and the published `gpui-component` / `gpui-base` 0.9.1 sources. The APIs cited
+below were re-checked against 0.10.0 on 2026-11-19 (see "GPUI Kit 0.10.0 upgrade" at the end).
 
 | Need | Candidate | Finding | Decision |
 |---|---|---|---|
@@ -275,7 +276,7 @@ Not verified: none of this was rendered or clicked (`es-deck` does not link here
 
 ## Completion popup: icons, footer hint (survey, no code yet)
 
-Goal: match the reference plugin's popup: a kind icon per row, the type right-aligned, and a footer line such as "Press Enter or Tab to replace". Checked in gpui-component / gpui-base 0.9.1.
+Goal: match the reference plugin's popup: a kind icon per row, the type right-aligned, and a footer line such as "Press Enter or Tab to replace". Checked in gpui-component / gpui-base 0.9.1; the conclusions still hold in 0.10.0, except that a deprecated item is now struck through.
 
 What the kit gives:
 - The popup is `CompletionMenu` in `gpui-component/src/input/popovers/completion_menu.rs`. A row is label + `detail` (muted italic, right). No icon slot and no footer; `CompletionItem.kind` is ignored when drawing. Only two things are configurable from outside: the label highlighter (`Lsp::set_completion_highlighter`, already used for subsequence marks) and the width (`Lsp::completion_menu.max_width`).
@@ -332,3 +333,25 @@ Decision: the user rejected the vendored fork (option 1) and chose to stay on th
 - Checked against the demo index's real mapping (typed by hand into a throwaway probe, not committed): boolean literals appear for `term`/`match`/`terms` on `in_stock`, not for `stock`, not inside a quoted value, and not under `sort`; `_source.includes`/`excludes` include `reviews.user/rating/comment`; the nested scope still lists only `reviews.*`. Remaining gaps seen there: only booleans get literal suggestions (numbers, dates and keyword enums still have none); the `{"field": "asc"}` sort shorthand is not resolved because the spec only models the object form (`{"field": {"order": "asc"}}`); the name in `{"aggs": {"<name>": ...}}` is the user's, so completion there is empty by design; with no mapping loaded every field list is empty and the reason (`NoMapping`) only reaches the LSP log, not the popup.
 - New dependencies: `futures` 0.3 in `es-deck` (MIT OR Apache-2.0, already in the tree through GPUI) for `select`; `es-client` enables tokio's `sync` feature for `Notify`.
 - Not verified: no external editor has connected over stdio, so snippet expansion is checked at the protocol level only; the 60 s TTL and the wake-up were not observed in the running app (the binary cannot be rendered on this machine); no benchmark was run after the `Arc` change.
+
+## GPUI Kit 0.10.0 upgrade
+
+Upgraded 2026-11-19 from the pinned 0.9.1 to 0.10.0 (`gpui-kit = "=0.10.0"` with the `tree-sitter` feature). `gpui-base`,
+`gpui-component`, `gpui-component-macros`, `gpui-kit-assets` and the `gpui-fast` family moved to their 0.10/0.1.17 versions
+with it. The app needed no source changes: `es-deck` compiles, and `cargo test --workspace` passes with the same results as
+before the upgrade.
+
+Re-checked in the 0.10.0 sources, because the rest of this document was written against 0.9.1:
+
+- `CompletionProvider` is still in `gpui-base` `input/editor/lsp/completions.rs` and still targets `lsp-types` 0.97.
+- `CompletionMenu` is still `pub(crate)` at `gpui-component/src/input/popovers/completion_menu.rs`. Rows still draw only
+  label and `detail`; `CompletionItem.kind` is still ignored, so the popup survey above stands. The visible change is that a
+  deprecated item is struck through. `Lsp::completion_menu.max_width` still caps the width.
+- `TableDelegate::perform_sort`, `load_more` and `ColumnSort` keep their paths and signatures in
+  `gpui-component/src/table`.
+- The default icon bundle is still the 106 names in `default-icons.txt`, so an icon outside it still has to be listed in
+  `ExtraIcons`; the asset test in `crates/es-deck/src/assets.rs` confirms the app's list loads.
+- The `tree-sitter` feature and its per-grammar features are unchanged.
+
+Not verified: nothing was rendered, so visual changes the kit made in 0.10.0 are not known to us; no changelog ships in the
+published crate, and only the APIs this project uses were inspected. The upgrade commit is separate, as CLAUDE.md requires.

@@ -7,7 +7,7 @@ GPUI Kit 的详细开发规则见 `docs/gpui-kit.md`(改动 `crates/es-deck/` �
 elasticsearch-deck:基于 GPUI Kit 的 Elasticsearch 桌面客户端。核心是 REST API 与 Query DSL 的语法补全,同时提供请求执行与结果浏览。
 
 - 语言:Rust
-- UI:GPUI Kit(`gpui-component` / `gpui-base`)。版本 0.9.x,尚未 1.0,API 可能变动
+- UI:GPUI Kit(`gpui-component` / `gpui-base`)。版本 0.10.x,尚未 1.0,API 可能变动
 - 补全引擎:独立 crate,同时以 LSP 服务形式提供
 - 命名:仓库与产品名 `elasticsearch-deck`;应用 crate 为 `es-deck`,构建相关 crate 使用前缀 `es-deck-`;引擎相关 crate 保持 `es-dsl-*`、`es-client`
 - 商标:名称含 Elasticsearch 字样,正式发布前需核对 Elastic 的商标使用政策(未核实具体条款)

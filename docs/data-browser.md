@@ -16,7 +16,7 @@
 - 表格是 `HitsTable`(`hits_table.rs`):一次性渲染 `es_client::Hits`,无排序、无分页。
 - `es_client::parse_hits` 已能把响应转成列和行,并给出 `total`(含 `10000+` 形式)。
 - `Request` / `Client::send` 已可发 `POST {index}/_search`;危险与只读判断在 `es-dsl-core/src/safety.rs`。
-- 内核表格组件(gpui-component 0.9.1 `table`)提供 `TableDelegate::perform_sort`、`load_more`、`ColumnSort`;其中 `perform_sort` 默认是空实现,需要自己实现并发请求。
+- 内核表格组件(gpui-component 0.10.0 `table`)提供 `TableDelegate::perform_sort`、`load_more`、`ColumnSort`;其中 `perform_sort` 默认是空实现,需要自己实现并发请求。
 
 ## 3. 调研结论(CLAUDE.md "调研优先")
 
