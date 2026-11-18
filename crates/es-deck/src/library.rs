@@ -29,9 +29,11 @@ impl Library {
     pub fn load(dir_file: &std::path::Path) -> Self {
         let saved_path = dir_file.with_file_name("saved.json");
         let history_path = dir_file.with_file_name("history.json");
+        // An unreadable file was moved aside by `load`; starting empty cannot overwrite it.
+        let mut saved: Vec<Saved> = history::load(&saved_path).unwrap_or_default();
+        saved::rename_auto_console(&mut saved);
         Self {
-            // An unreadable file was moved aside by `load`; starting empty cannot overwrite it.
-            saved: history::load(&saved_path).unwrap_or_default(),
+            saved,
             history: history::load(&history_path).unwrap_or_default(),
             saved_path,
             history_path,

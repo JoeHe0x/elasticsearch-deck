@@ -18,7 +18,7 @@
 - 改造前,标题栏由 GPUI Kit 的 `TitleBar` 画(`crates/es-deck/src/console.rs:1911-1935`):Windows/Linux 先放菜单栏,然后是常用命令(`render_toolbar`,`console.rs:2064-2152`),右端是 ES 版本号和「连接名 + Database 图标 + 下拉」按钮。
 - 连接下拉已经能切换连接、新建、管理(`render_connection_crumb`,`console.rs:1976-2033`),和面包屑的「连接」段是同一件事。
 - 左侧树顶部已经有连接名和在线/离线点(`console.rs:2573` 附近),与标题栏的连接信息重复。
-- Tab 名:`Data Browser` 存成 `BROWSER_PREFIX + 目标名`,`REST Console` 存成用户给的 console 名(默认 `console`),见 `console.rs:1202-1289`。
+- Tab 名:`Data Browser` 存成 `BROWSER_PREFIX + 目标名`,`REST Console` 存成用户给的 console 名(默认 `Default`),见 `console.rs:1202-1289`。
 - 当前光标下的请求块已经能解析出 `method`/`path`(`es_dsl_core::request::{Block, block_at}`),`active_block` 目前只记了范围(`console.rs:348`、`446-453`)。
 
 ### 1.3 建议方案

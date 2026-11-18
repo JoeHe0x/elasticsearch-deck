@@ -57,7 +57,18 @@ pub fn add(list: &mut Vec<Saved>, item: Saved) -> bool {
 }
 
 /// The console every connection starts with.
-pub const AUTO_CONSOLE: &str = "console";
+pub const AUTO_CONSOLE: &str = "Default";
+
+/// The first auto console was called `console`. A saved console still under that name is a
+/// connection's autosaved text, so it moves to [`AUTO_CONSOLE`] instead of being left behind as
+/// a stray entry in the saved list. Other kinds keep their names.
+pub fn rename_auto_console(list: &mut [Saved]) {
+    for item in list.iter_mut() {
+        if item.kind == Kind::Console && item.name == "console" {
+            item.name = AUTO_CONSOLE.into();
+        }
+    }
+}
 
 /// Stores `text` as the connection's console called `name`, creating it on first use.
 /// Returns false when nothing changed: the text is empty, may hold credentials, or is already stored.
@@ -188,6 +199,37 @@ mod tests {
         assert!(set_console(&mut list, "c", "users", "GET users", 5));
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].text, "GET b");
+    }
+
+    #[test]
+    fn the_old_auto_console_name_moves_to_the_new_one() {
+        let mut list = vec![
+            Saved {
+                connection: "c".into(),
+                kind: Kind::Console,
+                name: "console".into(),
+                text: "GET a".into(),
+                at: 1,
+            },
+            Saved {
+                connection: "c".into(),
+                kind: Kind::Console,
+                name: "logs".into(),
+                text: "GET b".into(),
+                at: 2,
+            },
+            Saved {
+                connection: "c".into(),
+                kind: Kind::Request,
+                name: "console".into(),
+                text: "GET c".into(),
+                at: 3,
+            },
+        ];
+        rename_auto_console(&mut list);
+        assert_eq!(list[0].name, AUTO_CONSOLE);
+        assert_eq!(list[1].name, "logs");
+        assert_eq!(list[2].name, "console", "only consoles move");
     }
 
     #[test]
