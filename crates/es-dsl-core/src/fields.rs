@@ -35,28 +35,36 @@ pub enum FieldKind {
     Other,
 }
 
+impl FieldKind {
+    /// Classifies a mapping type name. The mapping is the source of truth; this only groups the
+    /// names, and [`Field::kind`] is the shorthand for a whole field.
+    pub fn of(ty: &str) -> Self {
+        match ty {
+            "text" | "match_only_text" | "annotated_text" | "search_as_you_type" => Self::Text,
+            // `flattened` stores leaf values as keywords, so term-level queries can address it.
+            "keyword" | "constant_keyword" | "wildcard" | "flattened" => Self::Keyword,
+            "byte" | "short" | "integer" | "long" | "unsigned_long" | "half_float" | "float"
+            | "double" | "scaled_float" | "token_count" => Self::Numeric,
+            "date" | "date_nanos" => Self::Date,
+            "boolean" => Self::Boolean,
+            "ip" => Self::Ip,
+            "version" => Self::Version,
+            "geo_point" | "geo_shape" | "point" | "shape" => Self::Geo,
+            "nested" => Self::Nested,
+            // `alias` and `join` are queryable by name, but their target type is not in the mapping
+            // entry, so they stay `Other` and only the broad clauses take them.
+            "alias" | "join" => Self::Other,
+            "object" | "completion" | "dense_vector" | "sparse_vector" | "rank_feature"
+            | "rank_features" | "percolator" => Self::Object,
+            _ => Self::Other,
+        }
+    }
+}
+
 impl Field {
     /// Classifies the mapping type. The mapping is the source of truth; this only groups the names.
     pub fn kind(&self) -> FieldKind {
-        match self.ty.as_str() {
-            "text" | "match_only_text" | "annotated_text" | "search_as_you_type" => FieldKind::Text,
-            // `flattened` stores leaf values as keywords, so term-level queries can address it.
-            "keyword" | "constant_keyword" | "wildcard" | "flattened" => FieldKind::Keyword,
-            "byte" | "short" | "integer" | "long" | "unsigned_long" | "half_float" | "float"
-            | "double" | "scaled_float" | "token_count" => FieldKind::Numeric,
-            "date" | "date_nanos" => FieldKind::Date,
-            "boolean" => FieldKind::Boolean,
-            "ip" => FieldKind::Ip,
-            "version" => FieldKind::Version,
-            "geo_point" | "geo_shape" | "point" | "shape" => FieldKind::Geo,
-            "nested" => FieldKind::Nested,
-            // `alias` and `join` are queryable by name, but their target type is not in the mapping
-            // entry, so they stay `Other` and only the broad clauses take them.
-            "alias" | "join" => FieldKind::Other,
-            "object" | "completion" | "dense_vector" | "sparse_vector" | "rank_feature"
-            | "rank_features" | "percolator" => FieldKind::Object,
-            _ => FieldKind::Other,
-        }
+        FieldKind::of(&self.ty)
     }
 }
 

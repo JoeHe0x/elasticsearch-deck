@@ -107,6 +107,17 @@ impl ClusterMeta {
         self.lock().closed.clone()
     }
 
+    /// The mapping fields of `target` when they have been read; `None` when they have not
+    /// arrived yet. Unlike [`Fields::fields`] this never asks for a fetch, so a display that
+    /// repaints can read it every frame without keeping the refresh loop awake. A cached mapping
+    /// may still be stale.
+    pub fn cached(&self, target: &str) -> Option<Arc<[Field]>> {
+        self.lock()
+            .mappings
+            .get(target)
+            .map(|mapping| mapping.fields.clone())
+    }
+
     /// Makes the next refresh re-read index and alias names and re-fetch every mapping, while
     /// keeping the cached mappings usable until the new ones arrive.
     pub fn invalidate(&self) {
@@ -117,8 +128,19 @@ impl ClusterMeta {
         }
     }
 
+    /// Records `target` for the next refresh and wakes the loop. Callers that show a mapping
+    /// without completing a request — the tree's expanded rows — ask the same way completion
+    /// does; a miss is served on the next refresh instead of leaving the callers blank.
+    pub fn request(&self, target: &str) {
+        let wake = self.request_locked(&mut self.lock(), target);
+        // Wake only after the lock is dropped: the loop takes it on its first line.
+        if wake {
+            self.wake.notify_one();
+        }
+    }
+
     /// Records `target` for the next refresh; true when it was not already recorded.
-    fn request(&self, s: &mut State, target: &str) -> bool {
+    fn request_locked(&self, s: &mut State, target: &str) -> bool {
         fetchable(target) && s.wanted.insert(target.into())
     }
 
@@ -155,11 +177,11 @@ impl Fields for ClusterMeta {
                     let wake = if fresh {
                         false
                     } else {
-                        self.request(&mut s, target)
+                        self.request_locked(&mut s, target)
                     };
                     (fields, wake)
                 }
-                None => (Arc::from([]), self.request(&mut s, target)),
+                None => (Arc::from([]), self.request_locked(&mut s, target)),
             }
         };
         // Wake only after the lock is dropped: the loop takes it on its first line.
@@ -220,14 +242,43 @@ mod tests {
         let meta = ClusterMeta::default();
 
         assert!(meta.fields("logs").is_empty(), "a miss never blocks");
+        assert!(meta.cached("logs").is_none(), "a miss is not a read");
         assert!(meta.fields("../x?").is_empty());
         meta.refresh(&client).await.unwrap();
 
+        assert!(
+            meta.cached("logs").is_some(),
+            "the refresh filled the mapping in"
+        );
         assert_eq!(meta.names(), ["logs", "logs-1"]);
         assert_eq!(meta.aliases(), ["logs"]);
         let f = meta.fields("logs");
         assert_eq!((f[0].name.as_str(), f[0].ty.as_str()), ("msg", "text"));
         assert!(!meta.lock().wanted.contains("../x?"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_request_fetches_the_mapping() {
+        let server = MockServer::start_async().await;
+        names_mocks(&server);
+        let mapping = mapping_mock(&server);
+        let client = Client::new(Config::new(server.base_url())).unwrap();
+        let meta = ClusterMeta::default();
+
+        // A caller that only asks whether the mapping is cached must not be stuck waiting for
+        // someone else to request it: the explicit request is the fetch.
+        assert!(meta.cached("logs").is_none());
+        meta.request("logs");
+        meta.refresh(&client).await.unwrap();
+        assert!(meta.cached("logs").is_some());
+        assert_eq!(meta.fields("logs")[0].name, "msg");
+        assert_eq!(mapping.calls(), 1);
+
+        // Only plain index expressions are requested.
+        meta.request("../x?");
+        meta.refresh(&client).await.unwrap();
+        assert!(meta.cached("../x?").is_none());
+        assert_eq!(mapping.calls(), 1);
     }
 
     #[tokio::test]

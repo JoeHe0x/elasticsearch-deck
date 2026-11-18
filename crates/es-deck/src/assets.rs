@@ -9,10 +9,12 @@ icon_assets!(
     ExtraIcons,
     [
         Bookmark,
+        Boxes,
         Braces,
         Brackets,
         CircleDot,
         CircleQuestionMark,
+        CircleSmall,
         Clock,
         Columns3,
         Copy,
@@ -26,6 +28,7 @@ icon_assets!(
         ListTree,
         Lock,
         LockOpen,
+        MapPin,
         PanelLeft,
         Pencil,
         Plug,
@@ -36,8 +39,10 @@ icon_assets!(
         Server,
         SquareTerminal,
         Table2,
+        Tag,
         ToggleLeft,
         Trash,
+        Type,
         Unplug
     ]
 );
@@ -65,6 +70,8 @@ impl AssetSource for AppAssets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::field_icon;
+    use es_dsl_core::FieldKind;
     use gpui_kit::assets::IconName;
 
     /// An icon the app draws itself has to be either a kit default or listed in `ExtraIcons`;
@@ -85,6 +92,22 @@ mod tests {
             assert!(
                 AppAssets.load(path.as_ref()).unwrap().is_some(),
                 "{path} is not in the asset source"
+            );
+        }
+    }
+
+    /// Every field row draws its type's icon. A type whose icon is not bundled leaves a blank
+    /// gap in front of the name, so all of them are checked, not just the common ones.
+    #[test]
+    fn every_field_type_icon_is_bundled() {
+        use FieldKind::*;
+        for kind in [
+            Text, Keyword, Numeric, Date, Boolean, Ip, Version, Geo, Object, Nested, Other,
+        ] {
+            let path = field_icon(kind).path();
+            assert!(
+                AppAssets.load(path.as_ref()).unwrap().is_some(),
+                "{path} for {kind:?} is not in the asset source"
             );
         }
     }

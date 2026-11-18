@@ -27,10 +27,12 @@ use gpui_kit::component::menu::{
 };
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::TableState;
 use gpui_kit::component::toolbar::Toolbar;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, GlobalState, Selectable as _, Side, Sizable as _,
@@ -38,10 +40,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
-    ParentElement as _, Render, Role, SharedString, StatefulInteractiveElement as _, Styled as _,
-    StyledText, Task, TestSupportExt as _, Window, actions, div, rems,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight,
+    Hsla, InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
+    MouseDownEvent, ParentElement as _, Pixels, Render, Role, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledText, Task, TestSupportExt as _, Window,
+    actions, div, rems,
 };
 
 use crate::appearance::{self, Pref};
@@ -56,7 +59,8 @@ use crate::paint::{self, Paint};
 use crate::schema_source;
 use crate::surface::Surfaces;
 use crate::targets::{
-    ConsoleOp, Folder, OpenInDataBrowser, OpenInRestConsole, Row, Targets, search_text,
+    ConsoleOp, FieldRow, Folder, OpenInDataBrowser, OpenInRestConsole, Row, Targets, field_icon,
+    search_text,
 };
 use es_dsl_core::Token;
 
@@ -343,11 +347,13 @@ pub struct Console {
     /// Diagnostics in the editor text as of the last check; `None` before the first one.
     problems: Option<usize>,
     /// JSON path at the cursor, as shown in the status bar; empty outside a body.
-    crumbs: SharedString,
+    crumbs: Vec<es_dsl_core::Seg>,
     /// The request under the cursor, as framed in the editor.
     active_block: Option<Range<usize>>,
     /// The request line under the cursor, as the title bar's context crumb shows it.
     request_line: SharedString,
+    /// The caret the last editor notification reported, to tell a real move from a repaint.
+    caret: usize,
     /// The tree line the user last picked. While it is set the title bar names that row's path,
     /// which is where the user just went; opening or switching a tab, or moving the caret to a
     /// request, hands the title bar back to the console.
@@ -359,6 +365,9 @@ pub struct Console {
     client: Arc<LspClient>,
     /// Whether the last metadata refresh reached the cluster; drives the connection crumb's dot.
     online: bool,
+    /// The tree's width as last dragged. Kept here so closing the tree removes its splitter
+    /// without forgetting where the user put it.
+    sidebar_width: Pixels,
     /// Whether the tree panel is shown.
     sidebar_open: bool,
     /// The connected cluster's completion cache, kept for the tree's refresh button.
@@ -441,7 +450,7 @@ impl Console {
         cx.observe(&editor, |this, editor, cx| {
             let state = editor.read(cx);
             let (text, cursor) = (state.value(), state.cursor());
-            let crumbs = breadcrumb(&es_dsl_core::path_at(&text, cursor));
+            let crumbs = es_dsl_core::path_at(&text, cursor);
             // The same resolution as `Request::at`: the request line under the cursor, else the
             // last one above it, else the first in the document. What is highlighted is what a
             // run would send, including when the caret sits above the first request line.
@@ -463,8 +472,13 @@ impl Console {
             }
             if line != this.request_line {
                 this.request_line = line.into();
-                // The caret is back in a request, so the title bar names it rather than the tree.
-                this.tree_crumb = None;
+                cx.notify();
+            }
+            // A moved caret means the user is back in the request, even when it stays inside the
+            // same block: the title bar follows the editor rather than a line picked in the tree.
+            let moved = cursor != this.caret;
+            this.caret = cursor;
+            if moved && this.tree_crumb.take().is_some() {
                 cx.notify();
             }
         })
@@ -494,6 +508,7 @@ impl Console {
                         ConsoleOp::Delete => this.delete_console(name, cx),
                         ConsoleOp::OpenBrowser => this.open_browser(name, cx),
                         ConsoleOp::OpenConsole => this.open_named(name, cx),
+                        ConsoleOp::ToggleFields => this.toggle_fields(&name, cx),
                     });
                 }));
         });
@@ -502,14 +517,15 @@ impl Console {
             // the editor takes over. A click arrives as `Confirm`, the arrow keys as `Select`.
             match ev {
                 ListEvent::Select(_) | ListEvent::Confirm(_) => {
-                    let path = list
-                        .read(cx)
-                        .delegate()
-                        .selected_path()
-                        .map(|(folder, label)| TreeCrumb {
-                            folder,
-                            label: label.map(SharedString::from),
-                        });
+                    let path =
+                        list.read(cx)
+                            .delegate()
+                            .selected_path()
+                            .map(|(folder, label, field)| TreeCrumb {
+                                folder,
+                                label: label.map(SharedString::from),
+                                field: field.map(|(name, kind)| (SharedString::from(name), kind)),
+                            });
                     if path != this.tree_crumb {
                         this.tree_crumb = path;
                         cx.notify();
@@ -629,15 +645,19 @@ impl Console {
             theme,
             appearance_file,
             problems: None,
-            crumbs: SharedString::default(),
+            crumbs: Vec::new(),
             active_block: None,
             request_line,
+            caret: 0,
             tree_crumb: None,
             run: Run::Idle,
             sending: None,
             index: Arc::new(index),
             client,
             online: false,
+            // Narrow enough that the request editor keeps most of the width; the tree's own
+            // filter and truncation handle long names.
+            sidebar_width: rems(16.0).to_pixels(window.rem_size()),
             sidebar_open: true,
             meta: None,
             refresh: None,
@@ -1757,6 +1777,26 @@ impl Console {
         self.load_catalog(cx);
     }
 
+    /// Shows or hides an index or alias row's mapping fields. A cached mapping appears at once; a
+    /// miss leaves a loading line and records the target, which wakes the metadata loop to fetch it.
+    fn toggle_fields(&mut self, target: &str, cx: &mut Context<Self>) {
+        let fields = self
+            .meta
+            .as_ref()
+            .and_then(|meta| match meta.cached(target) {
+                Some(fields) => Some(field_rows(&fields)),
+                None => {
+                    // Reading the cache does not fetch; a miss has to be recorded to be served.
+                    meta.request(target);
+                    None
+                }
+            });
+        self.targets.update(cx, |list, cx| {
+            list.delegate_mut().toggle_fields(target, fields);
+            cx.notify();
+        });
+    }
+
     /// Switches completion to `index`, the one that matches the connected version.
     fn use_index(
         &mut self,
@@ -1879,8 +1919,15 @@ impl Console {
                     }
                     this.targets.update(cx, |list, cx| {
                         let d = list.delegate_mut();
-                        let changed =
+                        let mut changed =
                             d.set(Folder::Indices, indices) | d.set(Folder::Aliases, aliases);
+                        // An expanded row shows the mapping the refresh loop fetched. Reading the
+                        // cache does not ask for anything, so a failed fetch is retried only when
+                        // the user collapses and reopens the row, not on every tick.
+                        for target in d.expanded_targets() {
+                            let fields = meta.cached(&target).map(|fields| field_rows(&fields));
+                            changed |= d.set_fields(&target, fields);
+                        }
                         if changed {
                             cx.notify();
                         }
@@ -1908,6 +1955,9 @@ impl Console {
 struct TreeCrumb {
     folder: Folder,
     label: Option<SharedString>,
+    /// The field under `label`: the selected line belongs to an expansion, so the index has to
+    /// stay in the path instead of being replaced by the field.
+    field: Option<(SharedString, es_dsl_core::FieldKind)>,
 }
 
 /// What the title bar shows after the connection: the Data Browser's target, the request under the
@@ -2091,6 +2141,14 @@ impl Console {
                     _ => context_crumb("crumb-row", crumb.folder.icon(), label, muted)
                         .into_any_element(),
                 });
+            }
+            if let Some((field, kind)) = crumb.field {
+                row = row.child(separator()).child(context_crumb(
+                    "crumb-field",
+                    field_icon(kind),
+                    field,
+                    muted,
+                ));
             }
         } else if let Some(context) = context {
             row = row.child(separator());
@@ -2334,15 +2392,40 @@ impl Console {
             })
     }
 
-    /// Bottom bar: the outcome of the last request on the left, the document check on the right.
+    /// Bottom bar: where the caret is on the left, the last request's outcome and the document
+    /// check on the right.
     fn render_status(&self, surfaces: Surfaces, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger, warning) = (theme.muted_foreground, theme.danger, theme.warning);
-        let colored = |color, text: SharedString| div().text_color(color).child(text);
+        let (muted, danger, warning, success) = (
+            theme.muted_foreground,
+            theme.danger,
+            theme.warning,
+            theme.success,
+        );
+        let mono = theme.mono_font_family.clone();
         let run = match &self.run {
             Run::Idle => None,
-            Run::Sending => Some(colored(muted, "Sending".into())),
-            Run::Failed(why) => Some(colored(danger, why.clone())),
+            Run::Sending => Some(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .text_color(muted)
+                    .child(Spinner::new().xsmall().color(muted))
+                    .child("Sending")
+                    .into_any_element(),
+            ),
+            Run::Failed(why) => Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_color(danger)
+                    .child(Icon::new(IconName::CircleX).xsmall().text_color(danger))
+                    .child(why.clone())
+                    .into_any_element(),
+            ),
             Run::Done {
                 status,
                 took,
@@ -2350,30 +2433,58 @@ impl Console {
                 cut,
                 found,
             } => {
-                let mut line = format!(
-                    "{status} · {} ms · {}",
-                    took.as_millis(),
-                    human_size(*bytes)
+                // The figures are separate pieces rather than one string: the status class and a
+                // truncated body warning have to stand out, the numbers only need to be readable.
+                let mut line = div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .font_family(mono);
+                line = line.child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if *status >= 400 { danger } else { success })
+                        .child(status.to_string()),
                 );
+                line = line.child(
+                    div()
+                        .text_color(muted)
+                        .child(format!("{} ms", took.as_millis())),
+                );
+                line = line.child(div().text_color(muted).child(human_size(*bytes)));
                 if let Some(found) = found {
-                    line.push_str(&format!(" · {found}"));
+                    line = line.child(div().text_color(muted).child(found.clone()));
                 }
                 if *cut {
-                    line.push_str(" · JSON shows the first 2 MB");
+                    line = line.child(
+                        div()
+                            .font_family(theme.font_family.clone())
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_color(warning)
+                            .child(Icon::new(IconName::TriangleAlert).xsmall())
+                            .child("Showing the first 2 MB"),
+                    );
                 }
-                Some(colored(
-                    if *status >= 400 { danger } else { muted },
-                    line.into(),
-                ))
+                Some(line.into_any_element())
             }
         };
         let problems = self.problems.map(|n| {
-            let text = match n {
-                0 => "No problems".to_string(),
-                1 => "1 problem".to_string(),
-                n => format!("{n} problems"),
+            let (text, color, icon) = match n {
+                0 => ("No problems".to_string(), muted, IconName::CircleCheck),
+                1 => ("1 problem".to_string(), warning, IconName::TriangleAlert),
+                n => (format!("{n} problems"), warning, IconName::TriangleAlert),
             };
-            colored(if n == 0 { muted } else { warning }, text.into())
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .text_color(color)
+                .child(Icon::new(icon).xsmall().text_color(color))
+                .child(text)
         });
         // The bar is window chrome: it shares the ground with the gutters instead of introducing
         // a third grey between the panels and the window edge.
@@ -2403,16 +2514,89 @@ impl Console {
                     .child("Readonly"),
             );
         }
+        // The left end answers "where is the caret"; the outcome of the last request answers
+        // "what happened" and belongs at the far end, out of the way while editing.
         if !self.crumbs.is_empty() {
-            bar = bar.left(colored(muted, self.crumbs.clone()));
+            bar = bar.left(self.render_json_path(cx));
         }
         if let Some(run) = run {
-            bar = bar.left(run);
+            bar = bar.right(run);
         }
         if let Some(problems) = problems {
             bar = bar.right(problems);
         }
         bar
+    }
+
+    /// The JSON path at the caret as a trail of keys and index chips, in mono so it reads as code
+    /// rather than as one grey sentence. The deepest keys say where the caret is, so a long path
+    /// keeps its tail. The whole trail copies the path on click.
+    fn render_json_path(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, blue, radius) = (theme.muted_foreground, theme.blue, theme.radius);
+        let full = path_text(&self.crumbs);
+        const TAIL: usize = 5;
+        let skip = self.crumbs.len().saturating_sub(TAIL);
+        let mut parts: Vec<AnyElement> = Vec::new();
+        if skip > 0 {
+            parts.push(div().text_color(muted).child("…").into_any_element());
+        }
+        for (i, seg) in self.crumbs[skip..].iter().enumerate() {
+            match seg {
+                es_dsl_core::Seg::Key(key) => {
+                    // A chevron between keys; an index chip hangs on the key it indexes instead
+                    // of starting a new step.
+                    if i > 0 {
+                        parts.push(
+                            Icon::new(IconName::ChevronRight)
+                                .xsmall()
+                                .text_color(muted.opacity(0.5))
+                                .into_any_element(),
+                        );
+                    }
+                    parts.push(
+                        div()
+                            .text_color(theme.foreground.opacity(0.9))
+                            .child(SharedString::from(key.clone()))
+                            .into_any_element(),
+                    );
+                }
+                es_dsl_core::Seg::Index(n) => parts.push(
+                    div()
+                        .px_1()
+                        .rounded(radius)
+                        .bg(blue.opacity(0.14))
+                        .text_color(blue)
+                        .child(SharedString::from(format!("[{n}]")))
+                        .into_any_element(),
+                ),
+            }
+        }
+        let copy = full.clone();
+        div()
+            .id("json-path")
+            .test_support()
+            .role(Role::Button)
+            .aria_label(format!("Copy JSON path {full}"))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(radius)
+            .px_1()
+            .py_0p5()
+            .font_family(theme.mono_font_family.clone())
+            .text_xs()
+            .cursor_pointer()
+            .hover(|hover| hover.bg(muted.opacity(0.12)))
+            .tooltip(|window, cx| Tooltip::new("Copy JSON path").build(window, cx))
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+            })
+            .child(Icon::new(IconName::Braces).xsmall().text_color(muted))
+            .children(parts)
     }
 
     /// Before the first response: a short hint and requests that show the shape without docs. A
@@ -2710,6 +2894,14 @@ const SAMPLES: [(&str, &str); 3] = [
     ),
 ];
 
+/// The mapping fields of `target`, as the tree lists them under its row.
+fn field_rows(fields: &[es_dsl_core::Field]) -> Vec<FieldRow> {
+    fields
+        .iter()
+        .map(|f| FieldRow::new(f.name.clone(), f.ty.clone()))
+        .collect()
+}
+
 fn human_size(bytes: usize) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),
@@ -2728,7 +2920,7 @@ impl Render for Console {
         let response = matches!(self.run, Run::Done { .. });
         // Idle is the only state with neither a result nor a request in flight to report.
         let empty = matches!(self.run, Run::Idle);
-        let sidebar_width = size(20.0);
+        let sidebar_width = self.sidebar_width;
         let tool = |id: &'static str, icon: IconName, tip: &'static str| {
             // The tooltip describes the button; an icon-only button still needs a name.
             Button::new(id)
@@ -2788,6 +2980,26 @@ impl Render for Console {
                     .pt_1()
                     .child(List::new(&self.targets).search_placeholder("Filter")),
             );
+        // The splitter is the tree's trailing edge. A hidden panel (`visible(false)`) still
+        // leaves the handle its neighbour draws, so a closed tree would keep a hairline at the
+        // window's left edge; the group is built without the tree instead. The remembered width
+        // reopens it where the user left it.
+        let mut split = h_resizable("console-split");
+        if sidebar {
+            split = split.child(
+                resizable_panel()
+                    .size(sidebar_width)
+                    .fixed()
+                    .size_range(size(14.0)..size(40.0))
+                    .child(div().size_full().pr_1().child(targets)),
+            );
+        }
+        let split = split.on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
+            let sizes = state.read(cx).sizes();
+            if sizes.len() > 1 {
+                this.sidebar_width = sizes[0];
+            }
+        }));
         div()
             .size_full()
             .flex()
@@ -2840,164 +3052,170 @@ impl Render for Console {
                 // The tree keeps its width: a drag on another handle never takes space from it. Panels clip their content and the editors do not wrap, so a narrower panel
                 // hides text instead of reflowing it.
                 div().flex_1().min_h_0().p_2().child(
-                    h_resizable("console-split")
-                        .child(
-                            resizable_panel()
-                                .visible(sidebar)
-                                .size(sidebar_width)
-                                .fixed()
-                                .size_range(size(16.0)..size(40.0))
-                                .child(div().size_full().pr_1().child(targets)),
-                        )
-                        .child(
-                            // The tabs belong to the editor and the response together, so they
-                            // get their own island above both. Sharing the panel background
-                            // instead would make the strip read as part of the editor card.
-                            resizable_panel().child(
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .flex_col()
-                                    .pl_1()
-                                    .child(
-                                        card()
-                                            .flex_none()
-                                            .p_1()
-                                            .child(self.render_tabs(surfaces, cx)),
-                                    )
-                                    .child(
-                                        div().flex_1().min_h_0().pt_2().child(
-                                            match self.browsers.get(&self.active) {
-                                                Some(browser) => card()
+                    split.child(
+                        // The tabs belong to the editor and the response together, so they
+                        // get their own island above both. Sharing the panel background
+                        // instead would make the strip read as part of the editor card.
+                        resizable_panel().child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .flex_col()
+                                .pl_1()
+                                .child(
+                                    card()
+                                        .flex_none()
+                                        .p_1()
+                                        .child(self.render_tabs(surfaces, cx)),
+                                )
+                                .child(
+                                    div().flex_1().min_h_0().pt_2().child(
+                                        match self.browsers.get(&self.active) {
+                                            Some(browser) => card()
+                                                .size_full()
+                                                .id("browser-card")
+                                                .test_support()
+                                                .p_2()
+                                                .child(browser.clone())
+                                                .into_any_element(),
+                                            None => {
+                                                // Nothing to analyze yet: the editor keeps the height.
+                                                let layout = if response {
+                                                    self.result_layout
+                                                } else {
+                                                    ResultLayout::Split
+                                                };
+                                                let show_body = layout != ResultLayout::Collapsed;
+                                                let editor_card = card()
                                                     .size_full()
-                                                    .id("browser-card")
+                                                    .id("editor-card")
                                                     .test_support()
                                                     .p_2()
-                                                    .child(browser.clone())
-                                                    .into_any_element(),
-                                                None => {
-                                                    // Nothing to analyze yet: the editor keeps the height.
-                                                    let layout = if response {
-                                                        self.result_layout
-                                                    } else {
-                                                        ResultLayout::Split
-                                                    };
-                                                    let show_body =
-                                                        layout != ResultLayout::Collapsed;
-                                                    let editor_card = card()
-                                                        .size_full()
-                                                        .id("editor-card")
-                                                        .test_support()
-                                                        .p_2()
-                                                        .child(
-                                                            Editor::new(&self.editor)
-                                                                .bordered(false)
-                                                                .h_full(),
-                                                        );
-                                                    let content = if response {
-                                                        self.render_response(cx, show_body)
-                                                            .into_any_element()
-                                                    } else if empty {
-                                                        self.render_empty_response(cx)
-                                                            .into_any_element()
-                                                    } else {
-                                                        div().into_any_element()
-                                                    };
-                                                    let response_card = card()
-                                                        .size_full()
-                                                        .id("result-card")
-                                                        .test_support()
-                                                        .p_2()
-                                                        .child(content);
-                                                    match layout {
-                                                        // Stacked by default: a request is wider than it is tall, and the
-                                                        // response beneath it keeps the full width for tables. Each
-                                                        // panel owns half the gutter, so the splitter's hover line
-                                                        // sits in the middle of the gap rather than on a card edge.
-                                                        ResultLayout::Split => {
-                                                            v_resizable("editor-split")
-                                                                .with_state(&self.split)
-                                                                .child(
-                                                                    resizable_panel().child(
+                                                    .child(
+                                                        Editor::new(&self.editor)
+                                                            .bordered(false)
+                                                            .h_full(),
+                                                    );
+                                                let content = if response {
+                                                    self.render_response(cx, show_body)
+                                                        .into_any_element()
+                                                } else if empty {
+                                                    self.render_empty_response(cx)
+                                                        .into_any_element()
+                                                } else {
+                                                    div().into_any_element()
+                                                };
+                                                let response_card = card()
+                                                    .size_full()
+                                                    .id("result-card")
+                                                    .test_support()
+                                                    .p_2()
+                                                    .child(content);
+                                                match layout {
+                                                    // Stacked by default: a request is wider than it is tall, and the
+                                                    // response beneath it keeps the full width for tables. Each
+                                                    // panel owns half the gutter, so the splitter's hover line
+                                                    // sits in the middle of the gap rather than on a card edge.
+                                                    ResultLayout::Split => {
+                                                        v_resizable("editor-split")
+                                                            .with_state(&self.split)
+                                                            .child(
+                                                                resizable_panel().child(
+                                                                    div()
+                                                                        .size_full()
+                                                                        .pb_1()
+                                                                        .child(editor_card),
+                                                                ),
+                                                            )
+                                                            .child(
+                                                                resizable_panel()
+                                                                    .size_range(
+                                                                        size(16.0)..size(120.0),
+                                                                    )
+                                                                    .child(
                                                                         div()
                                                                             .size_full()
-                                                                            .pb_1()
-                                                                            .child(editor_card),
+                                                                            .pt_1()
+                                                                            .child(response_card),
                                                                     ),
-                                                                )
-                                                                .child(
-                                                                    resizable_panel()
-                                                                        .size_range(
-                                                                            size(16.0)..size(120.0),
-                                                                        )
-                                                                        .child(
-                                                                            div()
-                                                                                .size_full()
-                                                                                .pt_1()
-                                                                                .child(
-                                                                                    response_card,
-                                                                                ),
-                                                                        ),
-                                                                )
-                                                                .into_any_element()
-                                                        }
-                                                        // Folded away: only the response's header row stays, at the
-                                                        // bottom, so the editor owns the rest of the height. Its
-                                                        // card must size to that row rather than to the whole column.
-                                                        ResultLayout::Collapsed => div()
-                                                            .size_full()
-                                                            .flex()
-                                                            .flex_col()
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .min_h_0()
-                                                                    .pb_1()
-                                                                    .child(editor_card),
                                                             )
-                                                            .child(
-                                                                div()
-                                                                    .flex_none()
-                                                                    .pt_1()
-                                                                    .child(response_card.h_auto()),
-                                                            )
-                                                            .into_any_element(),
-                                                        // The response alone, for reading the data. The content
-                                                        // already has its gutter below the tab island.
-                                                        ResultLayout::Maximized => div()
-                                                            .size_full()
-                                                            .flex()
-                                                            .flex_col()
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .min_h_0()
-                                                                    .child(response_card),
-                                                            )
-                                                            .into_any_element(),
+                                                            .into_any_element()
                                                     }
+                                                    // Folded away: only the response's header row stays, at the
+                                                    // bottom, so the editor owns the rest of the height. Its
+                                                    // card must size to that row rather than to the whole column.
+                                                    ResultLayout::Collapsed => div()
+                                                        .size_full()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_h_0()
+                                                                .pb_1()
+                                                                .child(editor_card),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_none()
+                                                                .pt_1()
+                                                                .child(response_card.h_auto()),
+                                                        )
+                                                        .into_any_element(),
+                                                    // The response alone, for reading the data. The content
+                                                    // already has its gutter below the tab island.
+                                                    ResultLayout::Maximized => div()
+                                                        .size_full()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_h_0()
+                                                                .child(response_card),
+                                                        )
+                                                        .into_any_element(),
                                                 }
-                                            },
-                                        ),
+                                            }
+                                        },
                                     ),
-                            ),
+                                ),
                         ),
+                    ),
                 ),
             )
             .child(self.render_status(surfaces, cx))
     }
 }
 
-/// `query › bool › must › [0]`, the way the status bar shows a JSON path.
-fn breadcrumb(path: &[es_dsl_core::Seg]) -> SharedString {
-    path.iter()
-        .map(|seg| match seg {
-            es_dsl_core::Seg::Key(k) => k.clone(),
-            es_dsl_core::Seg::Index(i) => format!("[{i}]"),
-        })
-        .collect::<Vec<_>>()
-        .join(" › ")
-        .into()
+/// `query.bool.must[0]`: the copy form of a JSON path. A key with a dot or a leading digit uses
+/// brackets so the result stays unambiguous.
+fn path_text(path: &[es_dsl_core::Seg]) -> String {
+    let mut out = String::new();
+    for seg in path {
+        match seg {
+            es_dsl_core::Seg::Key(key) => {
+                let plain = !key.is_empty()
+                    && !key.starts_with(|c: char| c.is_ascii_digit())
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_$-".contains(c));
+                if plain {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(key);
+                } else {
+                    out.push_str(&format!(
+                        "[\"{}\"]",
+                        key.replace('\\', "\\\\").replace('"', "\\\"")
+                    ));
+                }
+            }
+            es_dsl_core::Seg::Index(i) => out.push_str(&format!("[{i}]")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3672,6 +3890,94 @@ mod tests {
         .unwrap();
     }
 
+    /// The splitter is the tree's trailing edge. Closing the tree removes the group's handle with
+    /// it, so the content takes the full width instead of keeping a hairline at the window's edge.
+    #[gpui_kit::test]
+    fn closing_the_tree_takes_its_splitter_away(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.http = Some(Arc::new(
+                    Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap(),
+                ));
+            });
+        });
+        let open_x = cx
+            .update_window(window, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                window.find("editor-card").bounds().origin.x
+            })
+            .unwrap();
+        cx.update_window(window, |_, window, cx| window.click("toggle-tree", cx))
+            .unwrap();
+        cx.run_until_parked();
+        let closed_x = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(
+                    !console.read(cx).sidebar_open,
+                    "the toggle should close the tree"
+                );
+                window.find("editor-card").bounds().origin.x
+            })
+            .unwrap();
+        assert!(
+            closed_x < open_x,
+            "the editor takes the tree's width back ({closed_x:?} vs {open_x:?})"
+        );
+    }
+
+    /// The chevron on an index row is its own control: it expands the row without opening the
+    /// index, and names the row it would reveal or hide.
+    #[gpui_kit::test]
+    fn the_index_chevron_expands_the_row(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let targets = cx.update(|cx| console.read(cx).targets.clone());
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.http = Some(Arc::new(
+                    Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap(),
+                ));
+            });
+            targets.update(cx, |list, cx| {
+                list.delegate_mut().set(
+                    Folder::Indices,
+                    vec![Row {
+                        label: "logs".into(),
+                        text: "GET logs/_search".into(),
+                        closed: false,
+                    }],
+                );
+                cx.notify();
+            });
+        });
+        // The row lives in the Indices slot, and the chevron's id hangs off the row's.
+        let chevron = ("tree-expand", row_id("1/logs") as usize);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            assert!(window.try_find_by_label("Show fields of logs").is_some());
+            window.click(chevron, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find_by_label("Hide fields of logs").is_some(),
+                "the chevron expands the row"
+            );
+            window.click(chevron, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find_by_label("Show fields of logs").is_some(),
+                "the chevron collapses it again"
+            );
+        })
+        .unwrap();
+    }
+
     /// Disconnecting collapses the tabs to the default console but keeps the draft; a click on the
     /// remaining tab must not load an empty console over it.
     #[gpui_kit::test]
@@ -3733,6 +4039,58 @@ mod tests {
             cx.update(|cx| editor.read(cx).value().to_string()),
             "GET logs/_search"
         );
+    }
+
+    #[test]
+    fn a_json_path_copies_in_dot_and_bracket_form() {
+        use es_dsl_core::Seg;
+        let path = [
+            Seg::Key("query".into()),
+            Seg::Key("bool".into()),
+            Seg::Key("must".into()),
+            Seg::Index(0),
+            Seg::Key("match".into()),
+        ];
+        assert_eq!(path_text(&path), "query.bool.must[0].match");
+        // A key that would read as several steps, or as a bare number, takes brackets.
+        assert_eq!(
+            path_text(&[Seg::Key("a.b".into()), Seg::Key("2x".into())]),
+            "[\"a.b\"][\"2x\"]"
+        );
+        assert_eq!(path_text(&[]), "");
+    }
+
+    /// The path at the caret is a trail, not one grey string, and the whole trail is a single
+    /// copy target: the status bar has to be useful as a place to grab a field's path.
+    #[gpui_kit::test]
+    fn the_status_bar_shows_the_json_path_as_a_copyable_trail(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        let text =
+            "POST logs/_search\n{\"query\": {\"bool\": {\"must\": [{\"match_all\": {}}]}}}\n";
+        let marker = "\"match_all\": {";
+        let cursor = text.find(marker).unwrap() + marker.len();
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            editor.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                state.set_selected_range(cursor..cursor, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // The accessible name is exact, so it also pins the copy form of the path.
+            assert!(
+                window
+                    .try_find_by_label("Copy JSON path query.bool.must[0].match_all")
+                    .is_some(),
+                "the status bar should show the caret's path as one copy target"
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -3912,6 +4270,98 @@ mod tests {
         cx.update(|cx| console.update(cx, |this, cx| this.select_tab(0, cx)));
         cx.run_until_parked();
         cx.update(|cx| assert!(console.read(cx).tree_crumb.is_none()));
+    }
+
+    /// A field line is one level below its index, so the title bar adds it instead of replacing
+    /// the index with it.
+    #[gpui_kit::test]
+    fn selecting_a_field_names_it_under_its_index(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        let (window, console) = console_window(cx);
+        let targets = cx.update(|cx| console.read(cx).targets.clone());
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.http = Some(Arc::new(
+                    Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap(),
+                ));
+            });
+            targets.update(cx, |list, cx| {
+                list.delegate_mut().set(
+                    Folder::Indices,
+                    vec![Row {
+                        label: "logs".into(),
+                        text: "GET logs/_search".into(),
+                        closed: false,
+                    }],
+                );
+                // The Consoles folder is always shown; Indices follows it and starts open, so the
+                // index is on line 2 and its expanded field on line 3.
+                list.delegate_mut()
+                    .toggle_fields("logs", Some(vec![FieldRow::new("msg", "text")]));
+                cx.notify();
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            targets.update(cx, |list, cx| {
+                let ix = IndexPath::new(3);
+                list.set_selected_index(Some(ix), window, cx);
+                cx.emit(ListEvent::Confirm(ix));
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(window.find("crumb-folder").label(), Some("Indices"));
+            // An index keeps its menu-bearing crumb; the field follows it.
+            assert_eq!(window.find("crumb-target").label(), Some("logs"));
+            assert_eq!(window.find("crumb-field").label(), Some("msg"));
+        })
+        .unwrap();
+    }
+
+    /// Moving the caret back into the request editor takes the title bar back from the tree, even
+    /// when the caret stays inside the block the console was already showing. Without this, a
+    /// single-request console keeps naming the tree row no matter where the user clicks.
+    #[gpui_kit::test]
+    fn moving_the_caret_takes_the_title_bar_back_from_the_tree(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let editor = cx.update(|cx| console.read(cx).editor.clone());
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            editor.update(cx, |state, cx| {
+                state.set_value("GET a/_search\n", window, cx);
+                state.set_selected_range(0..0, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // As after a click in the tree, while the console keeps its document and caret.
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.tree_crumb = Some(TreeCrumb {
+                    folder: Folder::Nodes,
+                    label: Some("n1".into()),
+                    field: None,
+                });
+            });
+        });
+        cx.update_window(window, |_, _, cx| {
+            editor.update(cx, |state, cx| state.set_selected_range(2..2, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                console.read(cx).tree_crumb.is_none(),
+                "the caret is in the editor again"
+            );
+        });
     }
 
     /// A REST console path is two levels: the console's name, then the request under the caret.
