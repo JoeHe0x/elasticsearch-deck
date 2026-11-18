@@ -186,7 +186,7 @@ PRD:重启后恢复 Tab 与请求文本,**不保存凭据与响应体**。Data B
 - 请求构造(`from/size/track_total_hits/query/sort`)、KQL 翻译与 Lucene 回退、服务端错误原因提取、`max_result_window` 读取并停在窗口上限、按 mapping 决定可排序列(text → `.keyword`)。
 - 表头排序、翻页、页大小切换、刷新按钮、字段名补全、"没有匹配的文档"空态;新请求替换旧请求(丢弃 `Task` 即取消);
 - 单元格按类型显示(null、数字右对齐、数组/对象摘要 `a, b, c +N`)、列宽按内容估算、省略号加悬停全文、表头悬停显示 mapping 类型、列可拖动调序;斑马纹保留(`stripe(true)`)。
-- 点行展开右侧完整 JSON 面板(复制、关闭),行右键"Copy row as JSON";状态栏同时显示总耗时和集群 `took`;索引/别名右键菜单与快捷键。Console 结果表与 Data Browser 共用 `hits_table::view`。
+- 点行展开右侧完整 JSON 面板(复制、关闭),行右键"Copy row as JSON";状态栏同时显示总耗时和集群 `took`;索引/别名右键菜单与快捷键。Console 结果表与 Data Browser 共用 `hits_table` 的表格、列菜单与行详情;两者的排序不同——Data Browser 把排序写进自己生成的 `_search`,Console 只对已经返回的行做客户端排序,不改写用户的请求。
 
 ### 未做(相对产品水准的差距)
 - 复制单元格值、导出。
@@ -196,6 +196,6 @@ PRD:重启后恢复 Tab 与请求文本,**不保存凭据与响应体**。Data B
 - 持久化(§6)未实现;双击入口与 REST Console 的取舍(§8-1)按推荐项处理,未经产品确认。
 
 ### 未验证
-- **UI 从未在真实窗口里渲染过**:补全弹层、Enter 与补全菜单的冲突、32px 编辑器高度、斑马纹与类型化单元格外观、详情面板、列拖动、右键菜单快捷键提示都只是编译和无头测试通过。
+- **UI 从未在真实窗口里渲染过**:补全弹层、Enter 与补全菜单的冲突、32px 编辑器高度、斑马纹与类型化单元格外观、详情面板、列拖动、右键菜单快捷键提示都只是编译和无头测试通过。REST Console 结果表的列菜单、详情面板与客户端排序同样只有无头断言。
 - **没有对照真实集群**:mock 之外,`match`/`range` 作用于 date/ip 字段、7.x 与 8.x 的 `track_total_hits` 和 settings 路径、错误体结构,都没实测;没有 `it-cluster` 集成测试。
 - 加载/取消的实际观感、大索引上 `track_total_hits: true` 的耗时【待验证】。

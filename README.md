@@ -65,9 +65,12 @@ hand-written keyword tables, and is filtered by the connected cluster's version.
 
 - `_search` responses render as a table of `_id`, `_index`, `_score` and the union of `_source`
   keys.
+- The table sorts on a header click, hides columns from a menu, and opens a row's whole document
+  beside it. Sorting applies to the rows already returned; it never rewrites your request.
 - Any JSON response can also be viewed as a collapsible tree with JSONPath-style paths and
   **Copy path**, or as raw JSON.
-- **Save…** writes the complete response body, not just the part shown in the viewer.
+- **Save…** writes the complete response body, not just the part shown in the viewer, and adds a
+  `.json` extension when you leave one off.
 - The response panel can be collapsed or maximized while reading data.
 
 ### Cluster sidebar

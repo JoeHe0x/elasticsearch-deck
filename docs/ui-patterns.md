@@ -101,8 +101,10 @@ Tab 条可以有 `+ 新建`、拖拽排序、右上角「重开已关闭的 Tab�
 
 ### 2.5 结果表格
 
-- 表头右键:`Copy column name`、按该列排序、隐藏列。我们的 `HitsTable::context_menu`(`hits_table.rs:170-183`)只给了整行 `Copy row as JSON`,因为 0.10.0 的 `TableDelegate::context_menu` 只给 `row_ix`。要复制单元格,需要在 `render_td` 里给单元格自己挂 `context_menu`(或先做单元格选中),工作量 S–M。
+- 表头右键:`Copy column name`、按该列排序、隐藏列。我们的 `HitsTable::context_menu`(`hits_table.rs:206`)只给了整行 `Copy row as JSON`,因为 0.10.0 的 `TableDelegate::context_menu` 只给 `row_ix`。要复制单元格,需要在 `render_td` 里给单元格自己挂 `context_menu`(或先做单元格选中),工作量 S–M。
 - 行/选区导出 CSV/JSON:右键菜单和底栏都可以有,我们按 PRD V6 属 P1、不在本期,先把「复制」做好。
+- 已实现(两个表格共用 `hits_table`):点击表头排序;右上角列菜单逐列显隐,隐藏过列时提供 `Show all`;点击行在表格右侧打开完整文档,可复制、关闭;表头 tooltip 显示 mapping 类型(缓存里有才有)。Data Browser 的排序是服务端 `_search` 的 `sort`,改的是它自己生成的请求;REST Console 的排序只排已经返回的行,不重写用户的 DSL,所以不会把整个索引排好——要全局排序得自己在请求里加 `sort`。Console 的隐藏列、排序方向与打开的文档按 Tab 保存,切换 Tab 后回来仍在。
+- 响应保存:对话框保留输入的名字;没写扩展名时补 `.json`,用户自己写的扩展名(含 `.txt`)保持原样。
 
 ### 2.6 会话恢复
 
@@ -139,3 +141,4 @@ Tab 条可以有 `+ 新建`、拖拽排序、右上角「重开已关闭的 Tab�
 - 没有渲染本项目的面包屑/命令面板;0.10.0 的 `Breadcrumb`、`Command` 观感、`TitleBar` 在三种平台下的可用宽度都未实测。
 - 标题栏面包屑在 1200px 以下窗口的截断策略、macOS 红绿灯左侧 80px 与 Windows/Linux 菜单栏的排布,需要实际跑一次再定。
 - 树行元信息依赖 `_cat/indices` 的 `health,docs.count,store.size` 在 7.x/8.x 的返回格式,尚未对照真实集群。
+- REST Console 表格的列菜单、行详情面板与客户端排序只做了无头断言,没有在真实窗口里看过;380px 的详情面板在窄窗口下的表现未实测。表头类型依赖 mapping 已经缓存,首次响应时可能还空着,重发或改列后才补齐。
