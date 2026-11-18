@@ -799,7 +799,9 @@ impl ListDelegate for Targets {
                 item(("tree-loading", row_id(&format!("{slot}/{label}")) as usize)).child(
                     div()
                         .w_full()
-                        .h(rems(1.5))
+                        // The list measures one row and gives every item that height, so every
+                        // kind of row has to be the same height or the slots drift apart.
+                        .h(rems(1.75))
                         .pl_16()
                         .pr_4()
                         .flex()
@@ -859,7 +861,7 @@ impl ListDelegate for Targets {
                     div()
                         .relative()
                         .w_full()
-                        .h(rems(1.5))
+                        .h(rems(1.75))
                         // Each level of an object steps right by the chevron's width.
                         .pl(rems(4.0 + field.depth as f32))
                         .pr_4()
@@ -869,14 +871,19 @@ impl ListDelegate for Targets {
                         .min_w_0()
                         // A hairline per enclosing object, under that object's chevron, so rows at
                         // the same level line up across a long mapping. An open container also
-                        // draws its own level, otherwise the line would start one row too late
-                        // and break at the parent. The list item pads 4px above and below this
-                        // row, so each segment reaches past the padding to meet its neighbours
-                        // instead of leaving a gap at every row boundary.
+                        // draws its own level, but only from below its chevron: a full-height
+                        // line there would strike the expand icon. The list item pads 4px above
+                        // and below, so the other segments reach past that padding to meet their
+                        // neighbours instead of leaving a gap at every row boundary.
                         .children((0..field.depth + usize::from(field.open)).map(|level| {
+                            let top = if level < field.depth {
+                                rems(-0.25)
+                            } else {
+                                rems(1.375)
+                            };
                             div()
                                 .absolute()
-                                .top(rems(-0.25))
+                                .top(top)
                                 .bottom(rems(-0.25))
                                 .left(rems(4.5 + level as f32))
                                 .w(px(1.))

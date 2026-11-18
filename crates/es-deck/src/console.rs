@@ -370,6 +370,12 @@ pub struct Console {
     sidebar_width: Pixels,
     /// Whether the tree panel is shown.
     sidebar_open: bool,
+    /// The console split's sizes. Its own entity because the group indexes panels by position:
+    /// when the tree appears in front of the editor the stored editor width would otherwise be
+    /// read as the tree's, so the state is cleared whenever the panel count changes.
+    tree_split: Entity<ResizableState>,
+    /// Whether the console split currently includes the tree panel.
+    tree_shown: bool,
     /// The connected cluster's completion cache, kept for the tree's refresh button.
     meta: Option<es_client::ClusterMeta>,
     /// Dropping it stops refreshing for the previous connection.
@@ -620,6 +626,7 @@ impl Console {
         // The editor's draft is restored on startup, so the connection it ran against is too.
         panel.update(cx, |p, cx| p.reconnect_last(window, cx));
         let split = cx.new(|_| ResizableState::default());
+        let tree_split = cx.new(|_| ResizableState::default());
         // The editor was built with the restored text but has not notified yet, so the title bar's
         // request line comes from that same text rather than waiting for an event.
         let request_line: SharedString = es_dsl_core::block_at(text, 0)
@@ -641,6 +648,8 @@ impl Console {
             view: View::Table,
             result_layout: ResultLayout::Split,
             split,
+            tree_split,
+            tree_shown: false,
             readonly: false,
             theme,
             appearance_file,
@@ -2255,9 +2264,8 @@ impl Console {
             .items_center()
             .gap_1()
             .min_w_0()
-            .child(switcher)
             // Only a connection has a health to report; before one is open the button says
-            // "Connect…" and a dot would have nothing to describe.
+            // "Connect…" and a dot would have nothing to describe. The dot leads the name.
             .when(self.summary.is_some(), |row| {
                 row.child(
                     div()
@@ -2265,10 +2273,10 @@ impl Console {
                         .role(Role::Status)
                         .aria_label(status)
                         .flex_none()
-                        .pl_1()
                         .child(div().size_1p5().rounded_full().bg(dot)),
                 )
             })
+            .child(switcher)
     }
 
     /// The active Data Browser's target. Its menu leads to the REST console for the same target,
@@ -2746,7 +2754,8 @@ impl Console {
                     .ghost()
                     .icon(IconName::Download)
                     .small()
-                    .label("Save…")
+                    .tooltip("Save a copy of the response")
+                    .accessibility_label("Save a copy of the response")
                     .on_click(cx.listener(|this, _, _, cx| this.save_response(cx))),
             );
         // Maximized, the response already has the height; the way out is to restore the split.
@@ -2984,7 +2993,14 @@ impl Render for Console {
         // leaves the handle its neighbour draws, so a closed tree would keep a hairline at the
         // window's left edge; the group is built without the tree instead. The remembered width
         // reopens it where the user left it.
-        let mut split = h_resizable("console-split");
+        if sidebar != self.tree_shown {
+            self.tree_shown = sidebar;
+            // The group keeps distances by panel index. Inserting the tree in front of the editor
+            // would hand the tree whatever size the editor had stored, so start over and let the
+            // remembered width below decide; closing does the same, keeping the state one-panel.
+            self.tree_split.update(cx, |state, _| state.clear());
+        }
+        let mut split = h_resizable("console-split").with_state(&self.tree_split);
         if sidebar {
             split = split.child(
                 resizable_panel()
@@ -3886,6 +3902,41 @@ mod tests {
         .unwrap();
         cx.update_window(window, |_, window, _| {
             assert_eq!(window.find_by_label("Disconnect").focused(), Some(true));
+        })
+        .unwrap();
+    }
+
+    /// The tree opens at its own width, not at the width the group held before the tree existed.
+    /// The group tracks a size per panel index, and the editor had already recorded the full
+    /// width when it was alone; inserting the tree in front must not adopt that number.
+    #[gpui_kit::test]
+    fn the_tree_opens_at_its_own_width(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        // One frame without a connection: the editor is the only panel and records its width.
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.http = Some(Arc::new(
+                    Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap(),
+                ));
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let card = window.try_find("editor-card").expect("the editor card");
+            let x = card.bounds().origin.x.as_f32();
+            assert!(
+                (200.0..400.0).contains(&x),
+                "the tree keeps its own width; the editor starts at {x}"
+            );
         })
         .unwrap();
     }
