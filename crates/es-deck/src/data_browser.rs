@@ -15,7 +15,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     Editor, EditorState, InputEvent, TextDecoration, TextDecorationCollection,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::table::{ColumnSort, TableEvent, TableState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::{
@@ -379,29 +379,19 @@ impl Render for DataBrowser {
                     .tooltip("Show or hide columns")
                     .disabled(columns.is_empty())
                     .dropdown_menu(move |menu, _, _| {
-                        // Wide indexes have up to 60 columns; the list must scroll.
-                        let menu = menu.scrollable(true).max_h(px(360.));
-                        let menu = if hidden.is_empty() {
-                            menu
-                        } else {
+                        let toggle: hits_table::OnColumn = {
                             let this = this.clone();
-                            menu.item(PopupMenuItem::new("Show all").on_click(
-                                move |_, window, cx| {
-                                    this.update(cx, |t, cx| t.show_all_columns(window, cx))
-                                },
-                            ))
-                            .separator()
+                            Rc::new(move |name, window, cx| {
+                                this.update(cx, |t, cx| t.toggle_column(name, window, cx));
+                            })
                         };
-                        columns.iter().fold(menu, |menu, name| {
-                            let (this, n) = (this.clone(), name.clone());
-                            menu.item(
-                                PopupMenuItem::new(name.clone())
-                                    .checked(!hidden.contains(name))
-                                    .on_click(move |_, window, cx| {
-                                        this.update(cx, |t, cx| t.toggle_column(&n, window, cx))
-                                    }),
-                            )
-                        })
+                        let show_all: hits_table::OnShowAll = {
+                            let this = this.clone();
+                            Rc::new(move |window, cx| {
+                                this.update(cx, |t, cx| t.show_all_columns(window, cx));
+                            })
+                        };
+                        hits_table::columns_menu(menu, &columns, &hidden, toggle, show_all)
                     })
             })
             .child(

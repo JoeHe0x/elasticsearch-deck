@@ -1,5 +1,6 @@
 //! The hits of a search response as a virtualized table.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use es_client::{CellKind, Hits};
@@ -23,6 +24,41 @@ pub fn view(table: &Entity<TableState<HitsTable>>) -> impl IntoElement {
             .header_row_height(px(28.))
             .stripe(true),
     )
+}
+
+/// Called with a column's name when the column menu is used.
+pub type OnColumn = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Called when the column menu asks for every hidden column back.
+pub type OnShowAll = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// The body of a "show or hide columns" menu, shared by the Console result and the Data Browser:
+/// every column ticked or unticked, and a way back to all of them.
+pub fn columns_menu(
+    menu: PopupMenu,
+    columns: &[String],
+    hidden: &HashSet<String>,
+    toggle: OnColumn,
+    show_all: OnShowAll,
+) -> PopupMenu {
+    // Wide indexes have up to 60 columns; the list must scroll.
+    let menu = menu.scrollable(true).max_h(px(360.));
+    let menu = if hidden.is_empty() {
+        menu
+    } else {
+        menu.item(
+            PopupMenuItem::new("Show all").on_click(move |_, window, cx| show_all(window, cx)),
+        )
+        .separator()
+    };
+    columns.iter().fold(menu, |menu, name| {
+        let (toggle, n) = (toggle.clone(), name.clone());
+        menu.item(
+            PopupMenuItem::new(name.clone())
+                .checked(!hidden.contains(name))
+                .on_click(move |_, window, cx| toggle(&n, window, cx)),
+        )
+    })
 }
 
 /// Called with a column's name and the sort a header click asked for.

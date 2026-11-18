@@ -1,6 +1,6 @@
 //! The request editor: a GPUI Kit code editor whose completions come from the in-process LSP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -30,7 +30,7 @@ use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_pane
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::table::TableState;
+use gpui_kit::component::table::{ColumnSort, TableEvent, TableState};
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
@@ -301,6 +301,10 @@ fn browser_key(target: &str) -> String {
 struct Pane {
     run: Run,
     hits: Option<Entity<TableState<HitsTable>>>,
+    parsed: Option<es_client::Hits>,
+    hidden: HashSet<String>,
+    sort: Option<(String, ColumnSort)>,
+    detail: Option<usize>,
     tree: Option<Entity<TreeState>>,
     full_body: Option<String>,
     view: View,
@@ -323,6 +327,15 @@ pub struct Console {
     response: Entity<EditorState>,
     /// Set when the last response was a search; it is what the Table view shows.
     hits: Option<Entity<TableState<HitsTable>>>,
+    /// The page as parsed, so hiding a column or sorting the table rebuilds it without a request.
+    parsed: Option<es_client::Hits>,
+    /// Columns the user hid in the Table view; kept across runs of this console.
+    hidden: HashSet<String>,
+    /// The clicked column and its direction. The console sorts the rows it already has: the
+    /// request is the user's, so the rest of the index is not re-queried.
+    sort: Option<(String, ColumnSort)>,
+    /// The row whose whole document the side panel shows.
+    detail: Option<usize>,
     /// The last response as a collapsible tree; `None` when it was not JSON.
     tree: Option<Entity<TreeState>>,
     /// The whole last response body, for Save; the viewers may show less.
@@ -639,6 +652,10 @@ impl Console {
             http: None,
             response,
             hits: None,
+            parsed: None,
+            hidden: HashSet::new(),
+            sort: None,
+            detail: None,
             tree: None,
             full_body: None,
             targets,
@@ -889,8 +906,9 @@ impl Console {
                             Some(t) => format!("{} of {t} hits", h.rows.len()),
                             None => format!("{} hits", h.rows.len()),
                         });
-                        this.hits = parsed
-                            .map(|h| cx.new(|cx| TableState::new(HitsTable::new(h), window, cx)));
+                        this.parsed = parsed;
+                        this.detail = None;
+                        this.rebuild_hits(window, cx);
                         this.view = if this.hits.is_some() {
                             View::Table
                         } else {
@@ -910,6 +928,136 @@ impl Console {
             });
         }));
         cx.notify();
+    }
+
+    /// Builds the Table view from the last parsed page: hidden columns left out, the clicked
+    /// sort applied to the rows already loaded. The console shows the answer to the request the
+    /// user wrote, so neither hiding a column nor sorting sends anything.
+    fn rebuild_hits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hits = None;
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let keep: Vec<usize> = (0..parsed.columns.len())
+            .filter(|ix| !self.hidden.contains(&parsed.columns[*ix]))
+            .collect();
+        let names: Vec<String> = keep.iter().map(|ix| parsed.columns[*ix].clone()).collect();
+        let mut order: Vec<usize> = (0..parsed.rows.len()).collect();
+        // The sort belongs to a visible column; hiding the sorted one drops it from the view.
+        let sorted = self.sort.as_ref().and_then(|(column, sort)| {
+            names
+                .iter()
+                .position(|n| n == column)
+                .map(|ix| (keep[ix], *sort))
+        });
+        if let Some((ix, sort)) = sorted {
+            order.sort_by(|a, b| {
+                let (ka, kb) = (parsed.kinds[*a][ix], parsed.kinds[*b][ix]);
+                let (va, vb) = (&parsed.rows[*a][ix], &parsed.rows[*b][ix]);
+                // Two numbers compare as numbers; text ignores case so `Apple` and `apple` stay
+                // together. Anything else falls back to the displayed text.
+                let cmp = match (ka, kb) {
+                    (es_client::CellKind::Number, es_client::CellKind::Number) => va
+                        .parse::<f64>()
+                        .ok()
+                        .zip(vb.parse::<f64>().ok())
+                        .and_then(|(a, b)| a.partial_cmp(&b))
+                        .unwrap_or_else(|| va.cmp(vb)),
+                    _ => va.to_lowercase().cmp(&vb.to_lowercase()),
+                };
+                match sort {
+                    ColumnSort::Descending => cmp.reverse(),
+                    _ => cmp,
+                }
+            });
+        }
+        let hits = es_client::Hits {
+            columns: names,
+            rows: order
+                .iter()
+                .map(|r| keep.iter().map(|c| parsed.rows[*r][*c].clone()).collect())
+                .collect(),
+            kinds: order
+                .iter()
+                .map(|r| keep.iter().map(|c| parsed.kinds[*r][*c]).collect())
+                .collect(),
+            total: parsed.total.clone(),
+            took_ms: parsed.took_ms,
+            docs: order.iter().map(|r| parsed.docs[*r].clone()).collect(),
+        };
+        let fields = self.hit_fields(parsed);
+        let sort = self.sort.as_ref().map(|(c, s)| (c.clone(), *s));
+        let table = HitsTable::new(hits).types(fields.iter()).sorting(
+            |_| true,
+            sort.as_ref().map(|(c, s)| (c.as_str(), *s)),
+            Rc::new({
+                let this = cx.entity().downgrade();
+                move |name, sort, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.sort_hits_by(name, sort, window, cx));
+                }
+            }),
+        );
+        let table = cx.new(|cx| TableState::new(table, window, cx));
+        cx.subscribe(&table, |this, _, ev: &TableEvent, cx| {
+            if let TableEvent::SelectRow(ix) = ev {
+                this.detail = Some(*ix);
+                cx.notify();
+            }
+        })
+        .detach();
+        self.hits = Some(table);
+        cx.notify();
+    }
+
+    /// The mapping fields of the indices the loaded hits came from, where they have been read.
+    /// The tree's refresh loop fetches the rest, so this sends nothing; the headers gain their
+    /// types on a later run rather than holding the table back.
+    fn hit_fields(&self, hits: &es_client::Hits) -> Arc<[es_dsl_core::Field]> {
+        use es_dsl_core::Fields as _;
+        let Some(meta) = &self.meta else {
+            return Arc::from([]);
+        };
+        let Some(ix) = hits.columns.iter().position(|c| c == "_index") else {
+            return Arc::from([]);
+        };
+        let mut seen = HashSet::new();
+        let mut fields: Vec<es_dsl_core::Field> = Vec::new();
+        for index in hits.rows.iter().map(|r| &r[ix]) {
+            if index.is_empty() || !seen.insert(index.clone()) {
+                continue;
+            }
+            for field in meta.fields(index).iter() {
+                if !fields.iter().any(|f| f.name == field.name) {
+                    fields.push(field.clone());
+                }
+            }
+        }
+        Arc::from(fields)
+    }
+
+    fn toggle_column(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.hidden.remove(name) {
+            self.hidden.insert(name.to_string());
+        }
+        self.rebuild_hits(window, cx);
+    }
+
+    fn show_all_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hidden.clear();
+        self.rebuild_hits(window, cx);
+    }
+
+    fn sort_hits_by(
+        &mut self,
+        column: &str,
+        sort: ColumnSort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sort = (sort != ColumnSort::Default).then(|| (column.to_string(), sort));
+        // The rows move, so the open document would belong to a different row.
+        self.detail = None;
+        self.rebuild_hits(window, cx);
     }
 
     /// Re-indents the JSON body of the request under the cursor; one undo step reverts it.
@@ -1060,6 +1208,10 @@ impl Console {
         let pane = Pane {
             run,
             hits: self.hits.take(),
+            parsed: self.parsed.take(),
+            hidden: std::mem::take(&mut self.hidden),
+            sort: self.sort.take(),
+            detail: self.detail.take(),
             tree: self.tree.take(),
             full_body: self.full_body.take(),
             view: self.view,
@@ -1074,6 +1226,8 @@ impl Console {
             return String::new();
         };
         (self.run, self.hits, self.tree) = (next.run, next.hits, next.tree);
+        (self.parsed, self.sort, self.detail) = (next.parsed, next.sort, next.detail);
+        self.hidden = next.hidden;
         (self.full_body, self.view) = (next.full_body, next.view);
         next.shown
     }
@@ -1675,6 +1829,8 @@ impl Console {
         self.panes.clear();
         self.browsers.clear();
         (self.hits, self.tree, self.full_body) = (None, None, None);
+        (self.parsed, self.sort, self.detail) = (None, None, None);
+        self.hidden.clear();
         self.view = View::Json;
         self.targets.update(cx, |list, cx| {
             list.delegate_mut().clear();
@@ -2749,6 +2905,37 @@ impl Console {
                     .label("Copy path")
                     .on_click(cx.listener(|this, _, _, cx| this.copy_path(cx)))
             }))
+            .children(table.map(|_| {
+                let columns = self
+                    .parsed
+                    .as_ref()
+                    .map(|p| p.columns.clone())
+                    .unwrap_or_default();
+                let hidden = self.hidden.clone();
+                let this = cx.entity();
+                Button::new("result-columns")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Columns3)
+                    .tooltip("Show or hide columns")
+                    .accessibility_label("Show or hide columns")
+                    .disabled(columns.is_empty())
+                    .dropdown_menu(move |menu, _, _| {
+                        let toggle: hits_table::OnColumn = {
+                            let this = this.clone();
+                            Rc::new(move |name, window, cx| {
+                                this.update(cx, |t, cx| t.toggle_column(name, window, cx));
+                            })
+                        };
+                        let show_all: hits_table::OnShowAll = {
+                            let this = this.clone();
+                            Rc::new(move |window, cx| {
+                                this.update(cx, |t, cx| t.show_all_columns(window, cx));
+                            })
+                        };
+                        hits_table::columns_menu(menu, &columns, &hidden, toggle, show_all)
+                    })
+            }))
             .child(
                 Button::new("save-response")
                     .ghost()
@@ -2808,7 +2995,79 @@ impl Console {
         if show_body {
             viewer = viewer.child(
                 div().flex_1().min_h_0().child(match (table, outline) {
-                    (Some(t), _) => hits_table::view(t).into_any_element(),
+                    (Some(t), _) => {
+                        let doc = self
+                            .detail
+                            .and_then(|ix| t.read(cx).delegate().doc(ix))
+                            .map(|d| SharedString::from(d.to_string()));
+                        let (border, mono) = (theme.border, theme.mono_font_family.clone());
+                        div()
+                            .size_full()
+                            .flex()
+                            .child(div().flex_1().min_w_0().child(hits_table::view(t)))
+                            .children(doc.map(|doc| {
+                                let copied = doc.clone();
+                                div()
+                                    .w(rems(23.75))
+                                    .flex_none()
+                                    .flex()
+                                    .flex_col()
+                                    .border_l_1()
+                                    .border_color(border)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Document"),
+                                            )
+                                            .child(
+                                                Button::new("result-detail-copy")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(IconName::Copy)
+                                                    .tooltip("Copy the document")
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                copied.to_string(),
+                                                            ),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new("result-detail-close")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(IconName::Close)
+                                                    .tooltip("Close")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.detail = None;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("result-detail")
+                                            .test_support()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scroll()
+                                            .p_2()
+                                            .text_xs()
+                                            .font_family(mono)
+                                            .child(doc),
+                                    )
+                            }))
+                            .into_any_element()
+                    }
                     (None, Some(t)) => tree(t, move |_, entry, selected, _, _| {
                         let chevron = if !entry.is_folder() {
                             None
@@ -4819,6 +5078,109 @@ mod tests {
             "the request commands keep a menu home"
         );
         assert!(!view.iter().any(|name| name == "Settings…"));
+    }
+
+    /// The result table sorts the rows the response brought, hides columns and opens a row's
+    /// document, all without asking the cluster again: the request is the user's, not the table's.
+    #[gpui_kit::test]
+    fn the_result_table_sorts_hides_and_opens_rows_without_a_request(cx: &mut TestAppContext) {
+        use gpui_kit::component::table::TableDelegate as _;
+        const HITS: &str = r#"{"hits":{"total":{"value":2,"relation":"eq"},"hits":[
+            {"_index":"logs","_id":"1","_source":{"n":10,"msg":"b"}},
+            {"_index":"logs","_id":"2","_source":{"n":2,"msg":"a"}}]}}"#;
+        let (window, console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, cx| {
+                this.run = Run::Done {
+                    status: 200,
+                    took: Duration::from_millis(3),
+                    bytes: HITS.len(),
+                    cut: false,
+                    found: None,
+                };
+                this.parsed = es_client::parse_hits(HITS);
+                this.rebuild_hits(window, cx);
+                this.view = View::Table;
+            });
+            window.render_frame(cx);
+            assert!(
+                window.try_find("result-columns").is_some(),
+                "the Table view offers its columns"
+            );
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            console.update(cx, |this, cx| {
+                this.sort_hits_by("n", ColumnSort::Ascending, window, cx)
+            });
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let console = console.read(cx);
+            let table = console.hits.as_ref().unwrap().read(cx);
+            let d = table.delegate();
+            let n = (0..d.columns_count(cx))
+                .position(|ix| d.column(ix, cx).name == "n")
+                .expect("the n column");
+            assert_eq!(d.cell_text(0, n, cx), "2", "ascending sorts the numbers");
+            assert_eq!(d.column(n, cx).sort, Some(ColumnSort::Ascending));
+        });
+        cx.update_window(window, |_, window, cx| {
+            console.update(cx, |this, cx| this.toggle_column("_index", window, cx));
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let console = console.read(cx);
+            let table = console.hits.as_ref().unwrap().read(cx);
+            let d = table.delegate();
+            let names: Vec<_> = (0..d.columns_count(cx))
+                .map(|ix| d.column(ix, cx).name.to_string())
+                .collect();
+            assert!(
+                !names.contains(&"_index".to_string()),
+                "the column is hidden"
+            );
+            assert!(console.hidden.contains("_index"));
+        });
+        cx.update_window(window, |_, window, cx| {
+            console.update(cx, |this, cx| {
+                this.show_all_columns(window, cx);
+                this.sort_hits_by("n", ColumnSort::Descending, window, cx);
+            });
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let console = console.read(cx);
+            assert!(console.hidden.is_empty());
+            let table = console.hits.as_ref().unwrap().read(cx);
+            let d = table.delegate();
+            let n = (0..d.columns_count(cx))
+                .position(|ix| d.column(ix, cx).name == "n")
+                .expect("the n column back");
+            assert_eq!(
+                d.cell_text(0, n, cx),
+                "10",
+                "descending puts the largest first"
+            );
+        });
+        // Picking a row opens its document beside the table.
+        cx.update(|cx| {
+            let table = console.read(cx).hits.clone().unwrap();
+            table.update(cx, |t, cx| t.set_selected_row(0, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(console.read(cx).detail, Some(0)));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("result-detail").is_some(),
+                "the row's document is shown"
+            );
+            window.click("result-detail-close", cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(console.read(cx).detail, None));
     }
 
     /// An example in the empty response pane fills the editor and moves the cursor to the end, so
