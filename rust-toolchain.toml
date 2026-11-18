@@ -1,0 +1,8 @@
+[toolchain]
+# GPUI Kit's transitive dependency `gpui-pre-util` uses `slice::as_array`,
+# which is unstable on Rust 1.91 and only compiles on newer toolchains.
+# Pin the toolchain so every contributor and CI build gets a compatible
+# compiler.
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

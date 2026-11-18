@@ -305,6 +305,5 @@ paths:
 ## 附:本项目专属约束(非官方内容)
 - 补全弹层、请求编辑器等基于 Editor/Input 系统的组件,补全数据通过 `CompletionProvider` 一类的接口接入。**具体名称与签名以当前版本源码为准,实现前先核对。**
 - 危险请求确认使用 `AlertDialog`,标题点名具体对象(如 `Delete index "logs-2026"?`),按钮写具体结果(`Delete index`),不写 `OK`/`Yes`。
-- prod 连接的颜色标识必须来自语义 token(如 `danger`/`warning`),且不能只靠颜色表达(同时加文字标签)。
 - `es-dsl-core`、`es-client` 不得引入任何 GPUI Kit 依赖。
 - 响应表格(DataTable)的行标识用 `_index` + `_id`;补全请求和 mapping 加载都带 revision,过期结果丢弃。

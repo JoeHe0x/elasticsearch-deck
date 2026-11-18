@@ -23,6 +23,48 @@ GET idx/_search
 {"query": {"match": {"|
 has: title price
 ---
+# term only offers addressable leaf fields
+GET idx/_search
+{"query": {"term": {"|
+has: title price @timestamp user.name busy notes
+lacks: user tags tags.name loc
+---
+# range offers numeric and date fields (PRD A4)
+GET idx/_search
+{"query": {"range": {"|
+has: price @timestamp
+lacks: title user.name busy notes loc tags.name
+---
+# prefix offers string fields
+GET idx/_search
+{"query": {"prefix": {"|
+has: title user.name notes
+lacks: price @timestamp busy loc user tags.name
+---
+# sort array offers sortable fields
+GET idx/_search
+{"sort": ["|
+has: price @timestamp user.name busy
+lacks: title user tags.name loc
+---
+# terms aggregation field offers aggregatable fields
+GET idx/_search
+{"aggs": {"by_user": {"terms": {"field": "|
+has: price @timestamp user.name busy
+lacks: title user tags.name loc
+---
+# nested.path names the nested field, not its children
+GET idx/_search
+{"query": {"nested": {"path": "|
+has: tags
+lacks: tags.name title user
+---
+# multi_match field arrays never offer nested children
+GET idx/_search
+{"query": {"multi_match": {"fields": ["|
+has: title user.name
+lacks: tags.name
+---
 # range bound keys
 GET idx/_search
 {"query": {"range": {"price": {"|

@@ -7,7 +7,7 @@ use anyhow::Result;
 use gpui_kit::component::Rope;
 use gpui_kit::component::input::{CompletionProvider, HoverProvider, RopeExt as _};
 use gpui_kit::{App, AppContext as _, Task};
-use lsp_types::{CompletionContext, CompletionItem, CompletionResponse};
+use lsp_types::{CompletionContext, CompletionItem, CompletionResponse, CompletionTriggerKind};
 
 use crate::lsp_client::LspClient;
 
@@ -42,12 +42,22 @@ impl CompletionProvider for LspCompletion {
         &self,
         text: &Rope,
         offset: usize,
-        _trigger: CompletionContext,
+        trigger: CompletionContext,
         _window: &mut gpui_kit::Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         let pos = text.offset_to_position(offset);
         let text = text.to_string();
+        // A bare opening quote is not a request yet: the menu would open with nothing typed and
+        // its first item preselected, so the next Enter would accept that item instead of
+        // breaking the line. Typing a character asks again, and so does ShowCompletions.
+        if trigger.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
+            && text
+                .get(..offset)
+                .is_some_and(|before| before.ends_with('"'))
+        {
+            return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
+        }
         let client = self.0.clone();
         // The client blocks on the server's answer, so keep it off the UI thread.
         cx.background_spawn(
@@ -55,9 +65,10 @@ impl CompletionProvider for LspCompletion {
         )
     }
 
-    // The server decides what is completable, so the only rule here is when to ask: after identifier
-    // characters and an opening quote, never after structure (`{ [ , :`) or whitespace, where an
-    // auto-opened menu would swallow Enter.
+    // The server decides what is completable, so the only rule here is when to ask: after
+    // identifier characters, never after structure (`{ [ , :`) or whitespace, where an
+    // auto-opened menu would swallow Enter. A quote is reported as a trigger too, but the
+    // provider declines it until a character is typed or ShowCompletions asks explicitly.
     fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
         new_text.chars().any(is_trigger_char)
     }

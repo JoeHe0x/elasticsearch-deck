@@ -114,7 +114,7 @@ Tauri + Monaco + JSON Schema。补全引擎保持独立 crate,可复用。
 ### 5.1 集群连接管理
 | 编号 | 需求 | 优先级 |
 |---|---|---|
-| C1 | 新建/编辑/删除连接:名称、URL、环境标签(dev/test/prod) | P0 |
+| C1 | 新建/编辑/删除连接:名称、URL | P0 |
 | C2 | 认证:无认证、Basic、API Key、Bearer Token | P0 |
 | C3 | TLS:系统证书、自定义 CA、跳过校验(带醒目警告) | P0 |
 | C4 | 凭据存入系统钥匙串(Keychain/凭据管理器/Secret Service),不明文落盘 | P0 |
@@ -125,7 +125,7 @@ Tauri + Monaco + JSON Schema。补全引擎保持独立 crate,可复用。
 | 编号 | 需求 | 优先级 |
 |---|---|---|
 | E1 | 采用 Kibana Console 风格:`METHOD /path` 加可选 JSON 请求体,一个文档可含多个请求 | P0 |
-| E2 | 执行当前请求(光标所在)、执行选中、执行全部;快捷键 Ctrl/Cmd+Enter | P0 |
+| E2 | 执行光标所在请求;快捷键 Ctrl/Cmd+Enter | P0 |
 | E3 | JSON 高亮(Tree-sitter)、括号匹配、自动缩进、格式化/压缩 | P0 |
 | E4 | 支持 NDJSON(`_bulk`、`_msearch`)的编辑 | P1 |
 | E5 | 多标签页、文件保存/打开(`.es-deck` 或纯文本 `.es`) | P1 |
@@ -184,7 +184,6 @@ Tauri + Monaco + JSON Schema。补全引擎保持独立 crate,可复用。
 ### 5.7 安全与防误操作
 | 编号 | 需求 | 优先级 |
 |---|---|---|
-| S1 | 环境标签为 prod 的连接,界面有显著颜色标识(同时有文字标签,不只靠颜色) | P0 |
 | S2 | 危险请求(`DELETE`、`_delete_by_query`、`_update_by_query`、`POST _bulk` 含 delete、`_close`、`_forcemerge` 等)执行前二次确认 | P0 |
 | S3 | 连接可设为**只读模式**,拦截所有写操作(按 endpoint 语义判断,`POST _search`、`_count` 属于只读) | P1 |
 | S4 | 日志与历史不含明文凭据 | P0 |

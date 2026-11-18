@@ -65,7 +65,6 @@ cargo run -p es-deck-schema -- <schema.json> <index.json>   # 从 elasticsearch-
 - **集群集成测试**:使用 Docker 启动 Elasticsearch(7.x 和 8.x 各一个),默认不在普通 `cargo test` 里运行,用 feature `it-cluster` 启用。
 
 ## 安全规则(产品行为)
-- 环境标签为 prod 的连接必须有显著颜色标识。
 - 危险请求(`DELETE`、`_delete_by_query`、`_update_by_query`、含 delete 的 `_bulk`、`_close`、`_forcemerge` 等)执行前必须二次确认。
 - 只读模式下必须拦截写操作。只读判断按 endpoint 语义,而不是只看 HTTP 方法(`POST _search` 是只读的)。
 - 不引入遥测。若要加,必须默认关闭并先与产品确认。
