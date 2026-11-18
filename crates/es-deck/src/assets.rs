@@ -28,6 +28,7 @@ icon_assets!(
         LockOpen,
         PanelLeft,
         Pencil,
+        Plug,
         Plus,
         Quote,
         RefreshCw,
@@ -76,6 +77,9 @@ mod tests {
             IconName::Maximize,
             IconName::Minimize,
             IconName::Columns3,
+            // The Connect button in the connections dialog; without it the primary action renders
+            // as a label with a blank gap.
+            IconName::Plug,
         ] {
             let path = name.path();
             assert!(
