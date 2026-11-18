@@ -502,12 +502,18 @@ impl Console {
                     match folder {
                         Folder::Consoles => this.open_console(label, text, cx),
                         // A single click only selects; the second one opens the object's console.
+                        // Indices and aliases have a Data Browser to open; the rest have only a
+                        // request, which belongs in the REST console.
                         Folder::Indices | Folder::Aliases => {
                             if double {
                                 this.open_browser(label, cx);
                             }
                         }
-                        _ => this.append_request(text, false, cx),
+                        _ => {
+                            if double {
+                                this.append_request(text, false, cx);
+                            }
+                        }
                     }
                 }
             }
@@ -1284,33 +1290,63 @@ impl Console {
     }
 
     /// Appends a request to the editor, puts the cursor on its first line and checks the document.
-    /// `close_dialog` also closes the dialog the request was picked from.
+    /// `close_dialog` also closes the dialog the request was picked from. A Data Browser in front
+    /// of the editor gives way to the console first; appending to a hidden console would look like
+    /// nothing happened.
     fn append_request(&mut self, request: String, close_dialog: bool, cx: &mut Context<Self>) {
+        if self.browsers.contains_key(&self.active) {
+            self.show_console(cx);
+        }
         let editor = self.editor.clone();
         let Some(window) = cx.active_window() else {
             return;
         };
-        let _ = window.update(cx, |_, window, cx| {
-            if close_dialog {
-                window.close_dialog(cx);
-            }
-            editor.update(cx, |state, cx| {
-                let mut text = state.value().to_string();
-                if !text.is_empty() && !text.ends_with("\n\n") {
-                    text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+        // A list click delivers its event while the window is being updated, and an update from
+        // inside that event would be refused; the task runs once the event is done.
+        cx.spawn(async move |this, cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                if close_dialog {
+                    window.close_dialog(cx);
                 }
-                let start = text.len();
-                text.push_str(&request);
-                if !request.ends_with('\n') {
-                    text.push('\n');
-                }
-                state.set_value(text, window, cx);
-                state.set_selected_range(start..start, cx);
-                state.focus(window, cx);
+                editor.update(cx, |state, cx| {
+                    let mut text = state.value().to_string();
+                    if !text.is_empty() && !text.ends_with("\n\n") {
+                        text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+                    }
+                    let start = text.len();
+                    text.push_str(&request);
+                    if !request.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    state.set_value(text, window, cx);
+                    state.set_selected_range(start..start, cx);
+                    state.focus(window, cx);
+                });
             });
-        });
-        // `set_value` emits no change event, so ask for the check by hand.
-        self.lint(cx);
+            // `set_value` emits no change event, so ask for the check by hand.
+            let _ = this.update(cx, |this, cx| this.lint(cx));
+        })
+        .detach();
+    }
+
+    /// Leaves the Data Browser for the last console tab, so the editor is visible again. A tab
+    /// strip holding only browsers gets a fresh console to land in.
+    fn show_console(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .tabs
+            .iter()
+            .rposition(|name| !self.browsers.contains_key(name))
+        {
+            self.select_tab(ix, cx);
+            return;
+        }
+        let name = self.connection_name();
+        let text = self
+            .library
+            .read(cx)
+            .console(&name, saved::AUTO_CONSOLE)
+            .unwrap_or_default();
+        self.open_console(saved::AUTO_CONSOLE.into(), text, cx);
     }
 
     fn connection_name(&self) -> String {
@@ -3189,6 +3225,91 @@ mod tests {
             assert!(window.try_find_by_label("Connect").is_some());
         })
         .unwrap();
+    }
+
+    /// Nodes, templates, tasks and pipelines have no Data Browser, so a double-click on one puts
+    /// its request in the REST console. A Data Browser that is in front has to give way, or the
+    /// request would land in an editor the window does not show.
+    #[gpui_kit::test]
+    fn a_double_click_on_a_catalog_row_opens_the_rest_console(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        let (window, console) = console_window(cx);
+        let (editor, targets) = cx.update(|cx| {
+            let console = console.read(cx);
+            (console.editor.clone(), console.targets.clone())
+        });
+        let http = Arc::new(Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap());
+        let browser = cx
+            .update_window(window, |_, window, cx| {
+                window.activate_window();
+                console.update(cx, |this, _| {
+                    this.summary = Some(Summary {
+                        name: "c1".into(),
+                        version: "".into(),
+                    });
+                    this.http = Some(http.clone());
+                });
+                targets.update(cx, |list, cx| {
+                    list.delegate_mut().set(
+                        Folder::Nodes,
+                        vec![Row {
+                            label: "n1".into(),
+                            text: "GET _nodes/n1".into(),
+                            closed: false,
+                        }],
+                    );
+                    cx.notify();
+                });
+                cx.new(|cx| DataBrowser::new("logs".into(), http.clone(), None, window, cx))
+            })
+            .unwrap();
+        // As after opening an index: a browser tab in front of the editor.
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.browsers.insert("table:logs".into(), browser);
+                this.tabs.push("table:logs".into());
+                this.active = "table:logs".into();
+            });
+        });
+        // The folder starts closed; opening it puts its only row on line 2, after the Consoles
+        // and Nodes folder lines.
+        cx.update(|cx| {
+            targets.update(cx, |list, cx| {
+                list.delegate_mut().activate(IndexPath::new(1));
+                cx.notify();
+            });
+        });
+        // The kit asks for a confirm on every click and the handler reads two in a row as a
+        // double click. Emitting both inside one window update puts the handler in the same state
+        // a click does — the window is busy while the list dispatches its event — and keeps the
+        // pair inside the double-click interval whatever the machine is doing.
+        let confirm = |window: &mut Window, cx: &mut App| {
+            targets.update(cx, |list, cx| {
+                let ix = IndexPath::new(2);
+                list.set_selected_index(Some(ix), window, cx);
+                cx.emit(ListEvent::Confirm(ix));
+            });
+        };
+        cx.update_window(window, |_, window, cx| {
+            confirm(window, cx);
+            confirm(window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // Exactly one copy: the first click only selected.
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).value().to_string()),
+            "GET _nodes/n1\n",
+            "the request lands in the editor"
+        );
+        cx.update(|cx| {
+            let console = console.read(cx);
+            assert_eq!(
+                console.active,
+                saved::AUTO_CONSOLE,
+                "the console is in front again"
+            );
+        });
     }
 
     /// The tree's commands sit under the connection name as one toolbar: assistive technology
