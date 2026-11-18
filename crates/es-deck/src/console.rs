@@ -16,7 +16,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dialog::AlertDialog;
+use gpui_kit::component::dialog::{AlertDialog, DialogFooter};
 use gpui_kit::component::input::{
     Editor, EditorState, Enter, Input, InputEditsEvent, InputEvent, InputState, ShowCompletions,
 };
@@ -25,14 +25,18 @@ use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::menu::{
     AppMenuBar, ContextMenuExt as _, DropdownMenu as _, PopupMenuItem,
 };
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::TableState;
+use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, GlobalState, Selectable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, GlobalState, Selectable as _, Side, Sizable as _,
+    WindowExt as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
@@ -50,6 +54,7 @@ use crate::library::{Changed, Library};
 use crate::lsp_client::LspClient;
 use crate::paint::Paint;
 use crate::schema_source;
+use crate::surface::Surfaces;
 use crate::targets::{
     ConsoleOp, Folder, OpenInDataBrowser, OpenInRestConsole, Row, Targets, search_text,
 };
@@ -200,6 +205,9 @@ enum Run {
     },
     Failed(SharedString),
 }
+
+/// The notification id of a request that was stopped before it ran; see [`Console::fail`].
+struct FailureNote;
 
 fn tree_item(node: &es_client::Node, open: bool) -> TreeItem {
     TreeItem::new(node.path.clone(), node.label.clone())
@@ -370,9 +378,16 @@ impl Console {
             let state = editor.read(cx);
             let (text, cursor) = (state.value(), state.cursor());
             let crumbs = breadcrumb(&es_dsl_core::path_at(&text, cursor));
-            let block = es_dsl_core::block_spans(&text)
-                .into_iter()
-                .find(|b| (b.start..=b.end).contains(&cursor));
+            // The same resolution as `Request::at`: the request line under the cursor, else the
+            // last one above it, else the first in the document. What is highlighted is what a
+            // run would send, including when the caret sits above the first request line.
+            let spans = es_dsl_core::block_spans(&text);
+            let block = spans
+                .iter()
+                .rev()
+                .find(|b| cursor >= b.start)
+                .or_else(|| spans.first())
+                .cloned();
             if block != this.active_block {
                 this.paint.set_active(block.clone(), cx);
                 this.active_block = block;
@@ -456,6 +471,16 @@ impl Console {
         .detach();
         let history_list =
             cx.new(|cx| ListState::new(HistoryList::default(), window, cx).searchable(true));
+        // The row's delete button asks the console: the history file belongs to the library, and
+        // only the console knows which connection the open dialog shows.
+        let owner = cx.entity().downgrade();
+        history_list.update(cx, |list, _| {
+            list.delegate_mut().set_on_delete(move |entry, cx| {
+                if let Some(console) = owner.upgrade() {
+                    console.update(cx, |this, cx| this.remove_history(entry.clone(), cx));
+                }
+            });
+        });
         cx.subscribe(&history_list, |this, list, ev: &ListEvent, cx| {
             if let ListEvent::Confirm(ix) = ev {
                 let entry = list.read(cx).delegate().entry(*ix).cloned();
@@ -608,19 +633,26 @@ impl Console {
             return;
         }
         let Some(http) = self.http.clone() else {
-            self.fail("Not connected. Choose a connection first.", cx);
+            self.fail(window, "Not connected", "Choose a connection first.", cx);
             return;
         };
         let editor = self.editor.read(cx);
         let Some(req) = Request::at(&editor.value(), editor.cursor()) else {
             self.fail(
-                "No request at the cursor. Put the cursor in a request and try again.",
+                window,
+                "No request at the cursor",
+                "A request line starts with GET, POST, PUT, DELETE or HEAD, then its path.",
                 cx,
             );
             return;
         };
         if self.readonly && es_dsl_core::is_write(&req.method, &req.path) {
-            self.fail("Readonly is on. This request would change the cluster.", cx);
+            self.fail(
+                window,
+                "Readonly is on",
+                "This request would change the cluster.",
+                cx,
+            );
             return;
         }
         match es_dsl_core::danger(&req.method, &req.path, req.body.as_deref()) {
@@ -803,8 +835,24 @@ impl Console {
         cx.notify();
     }
 
-    fn fail(&mut self, message: &'static str, cx: &mut Context<Self>) {
-        self.run = Run::Failed(message.into());
+    /// Reports a request that was stopped before it ran. This is a toast rather than a run state:
+    /// the status bar tracks requests, and the last response should stay in the panel while the
+    /// user fixes the line the toast points at.
+    fn fail(
+        &mut self,
+        window: &mut Window,
+        title: &'static str,
+        message: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        // One toast per kind of failure: pressing send again replaces the toast it already shows
+        // rather than piling up copies of the same message.
+        window.push_notification(
+            Notification::error(message)
+                .title(title)
+                .id1::<FailureNote>(title),
+            cx,
+        );
         cx.notify();
     }
 
@@ -1058,27 +1106,23 @@ impl Console {
     }
 
     /// One tab per console: icon, name and a close button. Right-click renames or deletes a saved
-    /// console; the active one is tinted, so the strip reads at a glance.
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let conn = self.connection_name();
+    /// console; the active one uses the inset surface, so the strip reads at a glance without a
+    /// coloured border.
+    fn render_tabs(&self, surfaces: Surfaces, cx: &mut Context<Self>) -> impl IntoElement {
         let closable = self.tabs.len() > 1;
         let console = cx.entity();
         let theme = cx.theme();
-        let (muted, radius, blue) = (theme.muted_foreground, theme.radius, theme.blue);
+        let (muted, foreground, radius) = (theme.muted_foreground, theme.foreground, theme.radius);
         div()
             .flex()
             .items_center()
             .gap_1()
-            .px_1()
             .overflow_x_hidden()
             .children(self.tabs.iter().enumerate().map(|(ix, name)| {
                 let browsing = self.browsers.contains_key(name);
                 let shown = name.strip_prefix(BROWSER_PREFIX).unwrap_or(name);
-                let label = if conn.is_empty() {
-                    shown.to_string()
-                } else {
-                    format!("{shown} [{conn}]")
-                };
+                let label = shown.to_string();
+                let active = *name == self.active;
                 let tab = div()
                     .id(("console-tab", row_id(name)))
                     .flex_none()
@@ -1089,8 +1133,7 @@ impl Console {
                     .items_center()
                     .gap_2()
                     .rounded(radius)
-                    .border_1()
-                    .border_color(gpui_kit::transparent_black())
+                    .text_color(if active { foreground } else { muted })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.select_tab(ix, cx)))
                     .child(
@@ -1100,13 +1143,17 @@ impl Console {
                             IconName::SquareTerminal
                         })
                         .small()
-                        .text_color(muted),
+                        .text_color(if active {
+                            foreground
+                        } else {
+                            muted
+                        }),
                     )
                     .child(div().whitespace_nowrap().child(SharedString::from(label)));
-                let tab = if *name == self.active {
-                    tab.bg(blue.opacity(0.12)).border_color(blue.opacity(0.45))
+                let tab = if active {
+                    tab.bg(surfaces.inset)
                 } else {
-                    tab
+                    tab.hover(|s| s.bg(surfaces.hover))
                 };
                 let (rename, delete) = (console.clone(), console.clone());
                 let (rename_name, delete_name) = (name.clone(), name.clone());
@@ -1121,7 +1168,7 @@ impl Console {
                         .justify_center()
                         .rounded_sm()
                         .text_color(muted)
-                        .hover(|s| s.bg(muted.opacity(0.2)))
+                        .hover(|s| s.bg(surfaces.hover))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_named_tab(&target, cx);
@@ -1231,6 +1278,13 @@ impl Console {
             .update(cx, |library, cx| library.clear_history(&name, cx));
     }
 
+    /// Deletes one recorded request, leaving the rest of the connection's history in place.
+    fn remove_history(&mut self, entry: Entry, cx: &mut Context<Self>) {
+        let name = self.connection_name();
+        self.library
+            .update(cx, |library, cx| library.remove_history(&name, &entry, cx));
+    }
+
     /// Pushes the current connection's saved items into the tree.
     fn refresh_saved(&mut self, cx: &mut Context<Self>) {
         let name = self.connection_name();
@@ -1254,7 +1308,7 @@ impl Console {
         });
     }
 
-    fn store(&mut self, kind: Kind, text: String, cx: &mut Context<Self>) {
+    fn store(&mut self, kind: Kind, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let item = Saved {
             connection: self.connection_name(),
             kind,
@@ -1268,13 +1322,18 @@ impl Console {
             .library
             .update(cx, |library, cx| library.add_saved(item, cx))
         {
-            self.fail("Nothing to save, or it touches the security APIs.", cx);
+            self.fail(
+                window,
+                "Not saved",
+                "Nothing to save, or it touches the security APIs.",
+                cx,
+            );
         }
     }
 
-    fn save_console(&mut self, cx: &mut Context<Self>) {
+    fn save_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value().to_string();
-        self.store(Kind::Console, text, cx);
+        self.store(Kind::Console, text, window, cx);
     }
 
     /// Removes the console called `name`, closing its tab.
@@ -1427,21 +1486,20 @@ impl Console {
                 .w(rems(40.).to_pixels(window.rem_size()))
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(div().h_80().child(List::new(&list)))
-                        .child(
-                            div().flex().justify_end().child(
-                                Button::new("clear-history")
-                                    .ghost()
-                                    .small()
-                                    .label("Clear history")
-                                    .on_click(move |_, _, cx| {
-                                        console.update(cx, |this, cx| this.clear_history(cx))
-                                    }),
-                            ),
-                        ),
+                        .h_80()
+                        .child(List::new(&list).search_placeholder("Search requests")),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("clear-history")
+                            .small()
+                            .icon(IconName::Trash)
+                            .label("Clear history")
+                            .tooltip("Delete every request recorded for this connection")
+                            .on_click(move |_, _, cx| {
+                                console.update(cx, |this, cx| this.clear_history(cx))
+                            }),
+                    ),
                 )
         });
     }
@@ -1660,7 +1718,7 @@ fn install(state: &mut EditorState, client: &Arc<LspClient>) {
 }
 
 impl Console {
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, surfaces: Surfaces, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self
             .summary
             .as_ref()
@@ -1671,13 +1729,10 @@ impl Console {
             .summary
             .as_ref()
             .map_or(SharedString::default(), |s| s.version.clone());
-        // Flat, in the window ground colour, so the title bar and the islands read as one surface.
-        let ground = cx
-            .theme()
-            .background
-            .blend(cx.theme().foreground.opacity(0.09));
+        // The title bar is window chrome, not an island: it uses the same ground as the gutters
+        // so the top edge and the panels below read as one window.
         TitleBar::new()
-            .bg(ground)
+            .bg(surfaces.ground)
             .border_0()
             .child(self.menu_bar.clone())
             .child(self.render_toolbar(cx))
@@ -1700,26 +1755,44 @@ impl Console {
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, cx| {
                         let names = panel.read(cx).names();
+                        let empty = names.is_empty();
                         let menu = names.into_iter().fold(menu, |menu, name| {
                             let panel = panel.clone();
                             let target = name.clone();
                             menu.item(
                                 PopupMenuItem::new(name.clone())
+                                    .icon(IconName::Database)
                                     .checked(name == current)
                                     .on_click(move |_, window, cx| {
                                         panel.update(cx, |p, cx| p.switch_to(&target, window, cx))
                                     }),
                             )
                         });
-                        let console = console.clone();
-                        menu.separator()
-                            .item(PopupMenuItem::new("Manage connections…").on_click(
-                                move |_, window, cx| {
-                                    console.update(cx, |this, cx| {
-                                        this.open_connections(None, window, cx)
-                                    })
-                                },
-                            ))
+                        let (add, manage) = (console.clone(), console.clone());
+                        // The check sits on the right so every entry keeps its connection icon.
+                        menu.check_side(Side::Right)
+                            .when(empty, |menu| {
+                                menu.item(PopupMenuItem::label("No saved connections"))
+                            })
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("Add connection…")
+                                    .icon(IconName::Plus)
+                                    .on_click(move |_, window, cx| {
+                                        add.update(cx, |this, cx| {
+                                            this.open_connections(Some(false), window, cx)
+                                        })
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new("Manage connections…")
+                                    .icon(IconName::Settings)
+                                    .on_click(move |_, window, cx| {
+                                        manage.update(cx, |this, cx| {
+                                            this.open_connections(None, window, cx)
+                                        })
+                                    }),
+                            )
                     })
             }))
     }
@@ -1733,6 +1806,21 @@ impl Console {
             .gap_0p5()
             .ml_2()
             .on_mouse_down(MouseButton::Left, no_drag)
+            // The tree toggle leads the row: it sits at the edge of the window, next to the panel
+            // it controls, where it reads as window layout rather than one of the request commands.
+            .child(
+                Button::new("toggle-tree")
+                    .ghost()
+                    .small()
+                    .icon(IconName::PanelLeft)
+                    .selected(self.sidebar_open)
+                    .tooltip("Show or hide the tree")
+                    .accessibility_label("Show or hide the tree")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = !this.sidebar_open;
+                        cx.notify();
+                    })),
+            )
             .child(
                 Button::new("send")
                     .small()
@@ -1757,7 +1845,7 @@ impl Console {
                     .small()
                     .icon(IconName::Save)
                     .tooltip("Save a copy of the editor as a console")
-                    .on_click(cx.listener(|this, _, _, cx| this.save_console(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.save_console(window, cx))),
             )
             .child(
                 Button::new("format")
@@ -1766,18 +1854,6 @@ impl Console {
                     .icon(IconName::Braces)
                     .tooltip(format!("Re-indent the request body ({FORMAT_SHORTCUT})"))
                     .on_click(cx.listener(|this, _, window, cx| this.format(window, cx))),
-            )
-            .child(
-                Button::new("toggle-tree")
-                    .ghost()
-                    .small()
-                    .icon(IconName::PanelLeft)
-                    .selected(self.sidebar_open)
-                    .tooltip("Show or hide the tree")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_open = !this.sidebar_open;
-                        cx.notify();
-                    })),
             )
             .child(
                 Button::new("history")
@@ -1813,7 +1889,7 @@ impl Console {
     }
 
     /// Bottom bar: the outcome of the last request on the left, the document check on the right.
-    fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_status(&self, surfaces: Surfaces, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, danger, warning) = (theme.muted_foreground, theme.danger, theme.warning);
         let colored = |color, text: SharedString| div().text_color(color).child(text);
@@ -1853,7 +1929,9 @@ impl Console {
             };
             colored(if n == 0 { muted } else { warning }, text.into())
         });
-        let mut bar = StatusBar::new();
+        // The bar is window chrome: it shares the ground with the gutters instead of introducing
+        // a third grey between the panels and the window edge.
+        let mut bar = StatusBar::new().bg(surfaces.ground).border_0();
         // The toolbar button shows the mode too, but the status bar sits next to the response it
         // protects: a write refused silently there would otherwise look like a bug.
         if self.readonly {
@@ -2206,48 +2284,49 @@ impl Render for Console {
         let empty = matches!(self.run, Run::Idle);
         let sidebar_width = size(20.0);
         let tool = |id: &'static str, icon: IconName, tip: &'static str| {
-            Button::new(id).ghost().small().icon(icon).tooltip(tip)
+            // The tooltip describes the button; an icon-only button still needs a name.
+            Button::new(id)
+                .ghost()
+                .small()
+                .icon(icon)
+                .tooltip(tip)
+                .accessibility_label(tip)
         };
         let meta = self.meta.clone();
         let theme = cx.theme();
+        let surfaces = Surfaces::new(theme);
         let dot = if self.online {
             theme.success
         } else {
             theme.danger
         };
-        let surface = theme.background;
-        // JetBrains Islands look: flat theme-rounded panels on a darker ground, no border or shadow,
-        // separated by a small gap.
-        let radius = theme.radius;
-        let ground = theme.background.blend(theme.foreground.opacity(0.07));
-        let card = move || {
-            div()
-                .size_full()
-                .overflow_hidden()
-                .rounded(radius)
-                .bg(surface)
-        };
-        // Like an IDEA tool window: a title row, the actions as one quiet icon row under it, then the tree.
+        // Islands: flat rounded panels on the window ground, separated by one gutter width. The
+        // surface module owns the tone relationship, so this render does not need a mode-specific
+        // blend of its own.
+        let radius = theme.radius_lg;
+        let card = move || div().overflow_hidden().rounded(radius).bg(surfaces.panel);
+        // The sidebar only exists while a connection is open, so the name and its dot are enough;
+        // the title bar already carries the version.
         let header = div()
             .flex()
             .items_center()
             .gap_2()
-            .px_2()
-            .pt_1()
             .child(
                 div()
                     .flex_1()
                     .truncate()
+                    .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(SharedString::from(self.connection_name())),
             )
             .child(div().size_1p5().flex_none().rounded_full().bg(dot));
-        let actions = div()
-            .flex()
-            .items_center()
-            .gap_0p5()
-            .px_1()
-            .child(div().flex_1())
+        // The tree's commands are a toolbar, not a bare row of buttons: the toolbar gives them
+        // the Toolbar role and arrow-key focus between them, which a flex row does not.
+        // The border splits the toolbar from the name above it; it belongs to the toolbar row
+        // rather than sitting in a wrapper, so the two stay one header block.
+        let actions = Toolbar::new("tree-toolbar")
+            .border_t_1()
+            .border_color(theme.border)
             .child(
                 tool("tree-filter", IconName::Search, "Filter the tree")
                     .selected(self.filter_open)
@@ -2280,11 +2359,11 @@ impl Render for Console {
                     .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
             );
         let targets = card()
-            .bg(surface)
-            .p_1p5()
+            .size_full()
+            .p_2()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_2()
             .child(header)
             .child(actions)
             .child(
@@ -2297,7 +2376,7 @@ impl Render for Console {
             .size_full()
             .flex()
             .flex_col()
-            .bg(ground)
+            .bg(surfaces.ground)
             .on_action(cx.listener(|this, _: &OpenInDataBrowser, _, cx| {
                 if let Some(name) = this.selected_target(cx) {
                     this.open_browser(name, cx);
@@ -2335,11 +2414,11 @@ impl Render for Console {
             .on_action(
                 cx.listener(|this, _: &ShowShortcuts, window, cx| this.show_help(window, cx)),
             )
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(surfaces, cx))
             .child(
                 // The tree keeps its width: a drag on another handle never takes space from it. Panels clip their content and the editors do not wrap, so a narrower panel
                 // hides text instead of reflowing it.
-                div().flex_1().min_h_0().mx_1().mb_1().child(
+                div().flex_1().min_h_0().p_2().child(
                     h_resizable("console-split")
                         .child(
                             resizable_panel()
@@ -2347,23 +2426,32 @@ impl Render for Console {
                                 .size(sidebar_width)
                                 .fixed()
                                 .size_range(size(16.0)..size(40.0))
-                                .child(div().size_full().pr_0p5().child(targets)),
+                                .child(div().size_full().pr_1().child(targets)),
                         )
                         .child(
-                            // The tabs belong to the editor and the response together, so they sit above both.
+                            // The tabs belong to the editor and the response together, so they
+                            // get their own island above both. Sharing the panel background
+                            // instead would make the strip read as part of the editor card.
                             resizable_panel().child(
                                 div()
                                     .size_full()
                                     .flex()
                                     .flex_col()
-                                    .child(self.render_tabs(cx))
+                                    .pl_1()
                                     .child(
-                                        div().flex_1().min_h_0().child(
+                                        card()
+                                            .flex_none()
+                                            .p_1()
+                                            .child(self.render_tabs(surfaces, cx)),
+                                    )
+                                    .child(
+                                        div().flex_1().min_h_0().pt_2().child(
                                             match self.browsers.get(&self.active) {
                                                 Some(browser) => card()
+                                                    .size_full()
                                                     .id("browser-card")
                                                     .test_support()
-                                                    .p_1p5()
+                                                    .p_2()
                                                     .child(browser.clone())
                                                     .into_any_element(),
                                                 None => {
@@ -2376,9 +2464,10 @@ impl Render for Console {
                                                     let show_body =
                                                         layout != ResultLayout::Collapsed;
                                                     let editor_card = card()
+                                                        .size_full()
                                                         .id("editor-card")
                                                         .test_support()
-                                                        .p_1p5()
+                                                        .p_2()
                                                         .child(
                                                             Editor::new(&self.editor)
                                                                 .bordered(false)
@@ -2394,19 +2483,26 @@ impl Render for Console {
                                                         div().into_any_element()
                                                     };
                                                     let response_card = card()
+                                                        .size_full()
                                                         .id("result-card")
                                                         .test_support()
                                                         .p_2()
                                                         .child(content);
                                                     match layout {
                                                         // Stacked by default: a request is wider than it is tall, and the
-                                                        // response beneath it keeps the full width for tables.
+                                                        // response beneath it keeps the full width for tables. Each
+                                                        // panel owns half the gutter, so the splitter's hover line
+                                                        // sits in the middle of the gap rather than on a card edge.
                                                         ResultLayout::Split => {
                                                             v_resizable("editor-split")
                                                                 .with_state(&self.split)
                                                                 .child(
-                                                                    resizable_panel()
-                                                                        .child(editor_card),
+                                                                    resizable_panel().child(
+                                                                        div()
+                                                                            .size_full()
+                                                                            .pb_1()
+                                                                            .child(editor_card),
+                                                                    ),
                                                                 )
                                                                 .child(
                                                                     resizable_panel()
@@ -2416,7 +2512,7 @@ impl Render for Console {
                                                                         .child(
                                                                             div()
                                                                                 .size_full()
-                                                                                .pt_0p5()
+                                                                                .pt_1()
                                                                                 .child(
                                                                                     response_card,
                                                                                 ),
@@ -2435,16 +2531,18 @@ impl Render for Console {
                                                                 div()
                                                                     .flex_1()
                                                                     .min_h_0()
+                                                                    .pb_1()
                                                                     .child(editor_card),
                                                             )
                                                             .child(
                                                                 div()
                                                                     .flex_none()
-                                                                    .pt_0p5()
+                                                                    .pt_1()
                                                                     .child(response_card.h_auto()),
                                                             )
                                                             .into_any_element(),
-                                                        // The response alone, for reading the data.
+                                                        // The response alone, for reading the data. The content
+                                                        // already has its gutter below the tab island.
                                                         ResultLayout::Maximized => div()
                                                             .size_full()
                                                             .flex()
@@ -2453,7 +2551,6 @@ impl Render for Console {
                                                                 div()
                                                                     .flex_1()
                                                                     .min_h_0()
-                                                                    .pt_0p5()
                                                                     .child(response_card),
                                                             )
                                                             .into_any_element(),
@@ -2466,7 +2563,7 @@ impl Render for Console {
                         ),
                 ),
             )
-            .child(self.render_status(cx))
+            .child(self.render_status(surfaces, cx))
     }
 }
 
@@ -2488,7 +2585,7 @@ mod tests {
     use crate::lsp_client::sample_index;
     use gpui_kit::TestAppContext;
     use gpui_kit::component::ThemeMode;
-    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
 
     /// Real editor, real provider, real server: typing a key prefix opens the menu and Enter inserts the key.
     #[gpui_kit::test]
@@ -2951,6 +3048,113 @@ mod tests {
                 vec![saved::AUTO_CONSOLE.to_string(), "logs".to_string()]
             );
         });
+    }
+
+    /// The switcher is also the place to create a connection: adding one opens the dialog on a
+    /// blank form, and managing the saved list stays reachable from the same menu.
+    #[gpui_kit::test]
+    fn the_connection_menu_offers_adding_a_connection(cx: &mut TestAppContext) {
+        let (window, _console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            window.click("connections", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find_by_label("Add connection…").is_some());
+            assert!(window.try_find_by_label("Manage connections…").is_some());
+        })
+        .unwrap();
+    }
+
+    /// The dialog the switcher opens has the saved list on the left and every action on the right,
+    /// including when no connection is saved yet.
+    #[gpui_kit::test]
+    fn the_connections_dialog_shows_the_saved_list_and_actions(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            console.update(cx, |this, cx| this.open_connections(None, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find_by_label("New connection").is_some());
+            assert!(window.try_find_by_label("Test connection").is_some());
+            assert!(window.try_find_by_label("Save").is_some());
+            assert!(window.try_find_by_label("Connect").is_some());
+        })
+        .unwrap();
+    }
+
+    /// The tree's commands sit under the connection name as one toolbar: assistive technology
+    /// hears a toolbar, each icon-only button carries a name, and the arrow keys move along it.
+    #[gpui_kit::test]
+    fn the_tree_commands_are_a_named_toolbar(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        // Connecting would start the refresh loops against a cluster; the toolbar only needs the
+        // state that makes the sidebar visible.
+        cx.update(|cx| {
+            console.update(cx, |this, _| {
+                this.summary = Some(Summary {
+                    name: "c1".into(),
+                    version: "".into(),
+                });
+                this.online = true;
+                this.http = Some(Arc::new(
+                    Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap(),
+                ));
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            assert!(!window.find_all_by_role(Role::Toolbar).is_empty());
+            // The toggle that owns the tree leads the title bar row, next to the panel it shows
+            // and hides; among the request commands it was easy to miss.
+            let toggle = window
+                .try_find("toggle-tree")
+                .expect("the tree toggle is in the title bar");
+            let send = window.try_find("send").expect("the send button");
+            assert!(
+                toggle.bounds().origin.x < send.bounds().origin.x,
+                "the tree toggle comes before the request commands ({} vs {})",
+                toggle.bounds().origin.x.as_f32(),
+                send.bounds().origin.x.as_f32()
+            );
+            for label in ["Filter the tree", "Reload the tree", "Disconnect"] {
+                assert!(window.try_find_by_label(label).is_some(), "{label}");
+            }
+            window.click("tree-filter", cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert!(console.read(cx).filter_open));
+        // The toolbar owns the arrow keys: from the last button they wrap to the first.
+        cx.update_window(window, |_, window, cx| {
+            // Tab reaches the toolbar's buttons like any other control; stop on the middle one.
+            // A frame between steps matters: the tab order is built while painting.
+            for _ in 0..80 {
+                window.focus_next(cx);
+                window.render_frame(cx);
+                if window.find_by_label("Reload the tree").focused() == Some(true) {
+                    break;
+                }
+            }
+        })
+        .unwrap();
+        cx.simulate_keystrokes(window, "right");
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(window.find_by_label("Disconnect").focused(), Some(true));
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(window.find_by_label("Disconnect").focused(), Some(true));
+        })
+        .unwrap();
     }
 
     /// Disconnecting collapses the tabs to the default console but keeps the draft; a click on the

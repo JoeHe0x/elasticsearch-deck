@@ -56,10 +56,20 @@ pub fn split_blocks(text: &str) -> Vec<Block> {
 }
 
 /// The block containing the cursor (byte offset): from its request line up to the next request line.
+///
+/// A cursor on a request line belongs to that request, not to the one above, so pressing run at
+/// the start of a line sends the line the user is looking at. A cursor above the first request
+/// line (a leading blank or comment line, where an opened console leaves the caret) belongs to the
+/// first request, which is the one right under it; comments between requests stay with the request
+/// above them, as they do in the block's body.
 pub fn block_at(text: &str, cursor: usize) -> Option<Block> {
-    split_blocks(text)
-        .into_iter()
-        .find(|b| cursor >= b.line.start && cursor <= b.body.end)
+    let blocks = split_blocks(text);
+    blocks
+        .iter()
+        .rev()
+        .find(|b| cursor >= b.line.start)
+        .or_else(|| blocks.first())
+        .cloned()
 }
 
 #[cfg(test)]
@@ -114,7 +124,26 @@ mod tests {
         let text = "GET /a\n{}\nGET /b\n{}\n";
         assert_eq!(block_at(text, 0).unwrap().path, "/a");
         assert_eq!(block_at(text, 8).unwrap().path, "/a");
+        assert_eq!(block_at(text, 10).unwrap().path, "/b", "start of its line");
         assert_eq!(block_at(text, 12).unwrap().path, "/b");
         assert!(block_at("# only a comment\n", 3).is_none());
+        assert!(block_at("", 0).is_none());
+    }
+
+    /// An opened console whose text starts with a blank line puts the caret at offset 0; that
+    /// caret is visually on the first request and must send it.
+    #[test]
+    fn a_caret_above_the_first_request_line_belongs_to_it() {
+        let text = "\n# demo\nGET /a/_search\n{\"size\": 1}\n";
+        for cursor in [0, 1, 3, 7] {
+            assert_eq!(
+                block_at(text, cursor).unwrap().path,
+                "/a/_search",
+                "cursor: {cursor}"
+            );
+        }
+        // A comment between two requests stays with the request above it.
+        let between = "GET /a\n{}\n# second\nGET /b\n";
+        assert_eq!(block_at(between, 15).unwrap().path, "/a");
     }
 }

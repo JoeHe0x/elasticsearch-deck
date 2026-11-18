@@ -154,6 +154,15 @@ impl Library {
         self.persist_history(cx);
     }
 
+    /// Drops one recorded request and persists the file.
+    pub fn remove_history(&mut self, connection: &str, entry: &Entry, cx: &mut Context<Self>) {
+        // The entry carries its connection, but the check keeps a stale row from another
+        // connection's history from deleting a matching request here.
+        self.history
+            .retain(|e| !(e.connection == connection && e == entry));
+        self.persist_history(cx);
+    }
+
     fn persist_saved(&mut self, cx: &mut Context<Self>) {
         let (path, items) = (self.saved_path.clone(), self.saved.clone());
         // A failed write only loses this session's saves.
@@ -212,5 +221,41 @@ mod tests {
         });
         // Two accepted saves emitted; the refused one did not.
         assert_eq!(changes.get(), 2);
+    }
+
+    fn entry(connection: &str, path: &str) -> Entry {
+        Entry {
+            connection: connection.into(),
+            method: "GET".into(),
+            path: path.into(),
+            body: None,
+            at: 0,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn one_history_entry_can_be_removed(cx: &mut TestAppContext) {
+        let library = cx.new(|_| Library::blank());
+        let (keep, drop, other) = (
+            entry("a", "a/_search"),
+            entry("a", "b/_doc/1"),
+            entry("b", "x/_search"),
+        );
+        for e in [keep.clone(), drop.clone(), other.clone()] {
+            library.update(cx, |l, cx| l.record(e, cx));
+        }
+        library.update(cx, |l, cx| l.remove_history("a", &drop, cx));
+        library.read_with(cx, |l, _| {
+            let kept = l.history("a");
+            assert_eq!(kept.len(), 1);
+            assert_eq!(&kept[0], &keep);
+            // Removing from one connection leaves every other connection's history alone.
+            let untouched = l.history("b");
+            assert_eq!(untouched.len(), 1);
+            assert_eq!(&untouched[0], &other);
+        });
+        // The stale row of another connection matches nothing.
+        library.update(cx, |l, cx| l.remove_history("b", &keep, cx));
+        library.read_with(cx, |l, _| assert_eq!(&l.history("a")[0], &keep));
     }
 }

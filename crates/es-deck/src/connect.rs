@@ -8,15 +8,20 @@ use std::sync::Arc;
 use es_client::connection::{self, AuthKind, Connection, Keychain, Secrets};
 use es_client::{Client, ClusterMeta};
 use es_dsl_core::Version;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::AlertDialog;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::radio::{Radio, RadioGroup};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, WindowExt as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _,
+};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Window, div,
+    AnyElement, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, rems,
 };
 
 /// A cluster that answered `GET /`; the owner starts completion against it.
@@ -85,7 +90,7 @@ impl ConnectPanel {
         };
         match panel.saved.first().cloned() {
             Some(first) => panel.fill(&first, window, cx),
-            None => panel.fill(&Connection::default(), window, cx),
+            None => panel.fill(&blank(), window, cx),
         }
         panel.failure = unreadable;
         panel
@@ -120,7 +125,7 @@ impl ConnectPanel {
     /// secret: the keychain entry belongs to the original name.
     pub fn start_new(&mut self, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !copy {
-            self.fill(&Connection::default(), window, cx);
+            self.fill(&blank(), window, cx);
             return;
         }
         let name = format!("{} copy", self.name(cx));
@@ -296,6 +301,8 @@ impl ConnectPanel {
                 match outcome {
                     Ok((done, saved)) => {
                         this.saved = saved;
+                        // Connecting also saves the form's connection, so the list lights it up.
+                        this.editing = Some(done.name.clone());
                         cx.emit(done);
                         if !quiet {
                             window.close_dialog(cx);
@@ -342,7 +349,7 @@ impl ConnectPanel {
                 match done {
                     Ok(saved) => {
                         this.saved = saved;
-                        let next = this.saved.first().cloned().unwrap_or_default();
+                        let next = this.saved.first().cloned().unwrap_or_else(blank);
                         this.fill(&next, window, cx);
                         window.push_notification(format!("Deleted connection {name}."), cx);
                     }
@@ -376,42 +383,87 @@ impl ConnectPanel {
     }
 
     fn render_saved(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.name(cx);
+        // The row stays lit while the form is edited: `editing` survives a rename in progress,
+        // where the name field no longer matches the saved entry.
+        let current = self.editing.clone();
+        let muted = cx.theme().muted_foreground;
         div()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_2()
             .w_48()
             .flex_none()
             .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Saved connections")
+                    .children((!self.saved.is_empty()).then(|| self.saved.len().to_string())),
+            )
+            .child(
                 Button::new("new-connection")
                     .outline()
+                    .w_full()
+                    .icon(IconName::Plus)
                     .label("New connection")
                     .on_click(cx.listener(|this, _, window, cx| {
-                        let blank = Connection {
-                            url: "http://localhost:9200".into(),
-                            ..Connection::default()
-                        };
+                        let blank = blank();
                         this.fill(&blank, window, cx);
                     })),
             )
-            .children(self.saved.iter().map(|c| {
-                let target = c.clone();
-                Button::new(("saved", row_id(&c.name)))
-                    .ghost()
-                    .selected(c.name == current)
-                    .w_full()
-                    .child(
+            .child(
+                div()
+                    .id("saved-connections")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    // Scrolling keeps a long list from pushing the actions out of the dialog.
+                    .max_h(rems(22.))
+                    .overflow_y_scrollbar()
+                    .children(self.saved.is_empty().then(|| {
                         div()
-                            .w_full()
-                            .truncate()
-                            .text_left()
-                            .child(SharedString::from(c.name.clone())),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.fill(&target, window, cx);
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child("No saved connections"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("Connections you save appear here."),
+                            )
                     }))
-            }))
+                    .children(self.saved.iter().map(|c| {
+                        let target = c.clone();
+                        Button::new(("saved", row_id(&c.name)))
+                            .ghost()
+                            .selected(current.as_deref() == Some(c.name.as_str()))
+                            .w_full()
+                            .icon(IconName::Database)
+                            .accessibility_label(c.name.clone())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_left()
+                                    .child(SharedString::from(c.name.clone())),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.fill(&target, window, cx);
+                            }))
+                    })),
+            )
     }
 
     fn render_form(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -494,67 +546,98 @@ impl ConnectPanel {
                     }),
             )
             .children(self.insecure.then(|| {
-                div().text_sm().text_color(cx.theme().warning).child(
-                    "The server's identity is not checked. Use this only on a network you trust.",
-                )
+                let warning = cx.theme().warning;
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(warning)
+                    .child(Icon::new(IconName::TriangleAlert).small().text_color(warning))
+                    .child(
+                        "The server's identity is not checked. Use this only on a network you trust.",
+                    )
             }))
+    }
+
+    /// The result of the last Test, Save or Connect, on its own line so a long error never squeezes
+    /// the buttons. A failure and a notice never coexist: every attempt clears both first.
+    fn render_status(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (icon, color, text) = match (&self.failure, &self.notice) {
+            (Some(failure), _) => (IconName::TriangleAlert, cx.theme().danger, failure),
+            (None, Some(notice)) => (IconName::CircleCheck, cx.theme().success, notice),
+            (None, None) => return None,
+        };
+        Some(
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .text_sm()
+                .text_color(color)
+                .child(Icon::new(icon).small().text_color(color))
+                .child(div().min_w_0().child(text.clone()))
+                .into_any_element(),
+        )
     }
 
     fn render_actions(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let hint = self.auth != AuthKind::None;
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .children(self.failure.clone().map(|f| {
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .text_color(cx.theme().danger)
-                    .child(f)
-            }))
-            .children(self.notice.clone().map(|n| {
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .text_color(cx.theme().success)
-                    .child(n)
-            }))
-            .child(div().flex_1())
-            .children(self.is_saved(cx).then(|| {
-                Button::new("delete")
-                    .outline()
-                    .label("Delete…")
-                    .on_click(cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)))
-            }))
-            .child(
-                Button::new("test")
-                    .outline()
-                    .label("Test")
-                    .disabled(self.busy)
-                    .on_click(cx.listener(|this, _, window, cx| this.test(window, cx))),
-            )
-            .child(
-                Button::new("save")
-                    .outline()
-                    .label("Save")
-                    .disabled(self.busy)
-                    .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
-            )
-            .child(
-                Button::new("connect")
-                    .primary()
-                    .label("Connect")
-                    .loading(self.busy)
-                    .tooltip(if hint {
-                        "An empty secret keeps the one in the keychain"
-                    } else {
-                        "Connect"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| this.connect(window, cx))),
-            )
+        let status = self.render_status(cx);
+        div().flex().flex_col().gap_3().children(status).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .children(self.is_saved(cx).then(|| {
+                    Button::new("delete")
+                        .outline()
+                        .danger()
+                        .icon(IconName::Trash)
+                        .label("Delete…")
+                        .tooltip("Remove this connection and its saved secret")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)),
+                        )
+                }))
+                .child(div().flex_1())
+                .child(
+                    Button::new("test")
+                        .outline()
+                        .icon(IconName::Play)
+                        .label("Test connection")
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|this, _, window, cx| this.test(window, cx))),
+                )
+                .child(
+                    Button::new("save")
+                        .outline()
+                        .icon(IconName::Save)
+                        .label("Save")
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+                )
+                .child(
+                    Button::new("connect")
+                        .primary()
+                        .icon(IconName::Plug)
+                        .label("Connect")
+                        .loading(self.busy)
+                        // Only worth a tooltip when it says something the label does not.
+                        .when(hint, |button| {
+                            button.tooltip("An empty secret keeps the one in the keychain")
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| this.connect(window, cx))),
+                ),
+        )
+    }
+}
+
+/// A new connection form pointed at the default local cluster; the name stays empty until typed.
+fn blank() -> Connection {
+    Connection {
+        url: "http://localhost:9200".into(),
+        ..Connection::default()
     }
 }
 
@@ -664,10 +747,77 @@ impl Render for ConnectPanel {
                 div()
                     .flex()
                     .items_start()
-                    .gap_4()
+                    .gap_6()
                     .child(self.render_saved(cx))
                     .child(self.render_form(cx)),
             )
             .child(self.render_actions(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
+
+    fn conn(name: &str, url: &str) -> Connection {
+        Connection {
+            name: name.into(),
+            url: url.into(),
+            ..Connection::default()
+        }
+    }
+
+    /// Opening a saved connection from the list fills the form with it, and New connection clears
+    /// the form back to the defaults; both are reached through the dialog's own rows and buttons.
+    #[gpui_kit::test]
+    fn the_saved_list_fills_the_form_and_new_connection_clears_it(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, _panel) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        // A missing file loads as an empty list; the test supplies its own.
+                        let mut panel = ConnectPanel::new(PathBuf::from("unused.json"), window, cx);
+                        panel.saved = vec![
+                            conn("local", "http://localhost:9200"),
+                            conn("prod", "https://prod.example:9243"),
+                        ];
+                        let first = panel.saved[0].clone();
+                        panel.fill(&first, window, cx);
+                        panel
+                    })
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            window.activate_window();
+            window.render_frame(cx);
+            assert!(window.try_find_by_label("New connection").is_some());
+            assert_eq!(window.find_by_label("Name").value(), Some("local"));
+            window.click(("saved", row_id("prod")), cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find_by_label("Name").value(), Some("prod"));
+            assert_eq!(
+                window.find_by_label("URL").value(),
+                Some("https://prod.example:9243")
+            );
+            window.click("new-connection", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find_by_label("Name").value(), Some(""));
+            assert_eq!(
+                window.find_by_label("URL").value(),
+                Some("http://localhost:9200")
+            );
+        })
+        .unwrap();
     }
 }

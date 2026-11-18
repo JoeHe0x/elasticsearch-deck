@@ -325,6 +325,15 @@ mod tests {
         assert_eq!(first.body.as_deref(), Some("{\"q\": 1}\n"));
         let second = Request::at(text, text.len()).unwrap();
         assert_eq!((second.method.as_str(), second.body), ("DELETE", None));
+        // A console opened from the list starts with the caret at offset 0; a leading blank line
+        // must not make the request under it unreachable.
+        let opened = "\nGET a/_search\n{\"size\": 1}\n";
+        let first = Request::at(opened, 0).unwrap();
+        assert_eq!(
+            (first.method.as_str(), first.path.as_str()),
+            ("GET", "a/_search")
+        );
+        assert_eq!(first.body.as_deref(), Some("{\"size\": 1}\n"));
         assert!(Request::at("GET\n", 0).is_none());
         assert!(Request::at("", 0).is_none());
     }

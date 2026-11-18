@@ -2,11 +2,14 @@
 //! `appearance.json` next to the other config files.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Window, px};
 use serde::{Deserialize, Serialize};
+
+use crate::surface::Surfaces;
 
 /// What the user chose. `System` follows the OS now and whenever it changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -45,7 +48,7 @@ impl Pref {
 }
 
 /// Applies `pref`, then the look the rest of the app expects: the radii the kit resets on every
-/// theme load, and scrollbars that show a long response has more.
+/// theme load, the island surfaces, and scrollbars that show a long response has more.
 pub fn apply(pref: Pref, window: Option<&mut Window>, cx: &mut App) {
     match pref {
         Pref::System => Theme::sync_system_appearance(window, cx),
@@ -54,8 +57,34 @@ pub fn apply(pref: Pref, window: Option<&mut Window>, cx: &mut App) {
     }
     Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
     Theme::update(cx, |theme| {
-        theme.radius = px(8.0);
-        theme.radius_lg = px(12.0);
+        // Controls use the small radius; islands and dialogs use the large one. Sharing a single
+        // 8px radius made a row, a tab and a whole panel read as the same kind of object.
+        theme.radius = px(6.0);
+        theme.radius_lg = px(10.0);
+        let surfaces = Surfaces::new(theme);
+        // The kit paints the title bar, status bar, table and popovers from these tokens. Point
+        // them at the same surfaces the hand-built islands use, or the chrome drifts from the
+        // cards it sits next to.
+        theme.tokens.title_bar = surfaces.ground.into();
+        theme.tokens.status_bar = surfaces.ground.into();
+        theme.tokens.status_bar_border = surfaces.ground.into();
+        theme.tokens.table = surfaces.panel.into();
+        theme.tokens.table_head = surfaces.header.into();
+        theme.tokens.table_head_foreground = theme.muted_foreground.into();
+        theme.tokens.popover = surfaces.elevated.into();
+        // The kit paints a list row's hover and selection itself. Point both at the island tones
+        // so a selected tree row is one fill rather than the kit's blue plus the tree's own.
+        theme.list_active = surfaces.selected;
+        theme.list_hover = surfaces.hover;
+        theme.tokens.list_active = surfaces.selected.into();
+        theme.tokens.list_hover = surfaces.hover.into();
+        // The editor paints its own background from the highlight theme. If it keeps the theme
+        // background, the editor becomes a dark well inside a lighter panel instead of sharing
+        // the panel's surface.
+        let highlight = Arc::make_mut(&mut theme.highlight_theme);
+        highlight.style.editor_background = Some(surfaces.panel);
+        highlight.style.editor_gutter_background = Some(surfaces.panel);
+        highlight.style.editor_active_line = Some(surfaces.header);
     });
 }
 

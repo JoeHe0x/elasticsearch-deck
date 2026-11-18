@@ -6,8 +6,8 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Context, InteractiveElement as _, ParentElement as _, SharedString, Styled as _, Task,
-    Window, div, rems,
+    App, Context, FontWeight, InteractiveElement as _, ParentElement as _, SharedString,
+    Styled as _, Task, Window, div, rems,
 };
 
 use gpui_kit::actions;
@@ -262,14 +262,11 @@ impl ListDelegate for Targets {
     ) -> Option<Self::Item> {
         let theme = cx.theme();
         let (muted, radius) = (theme.muted_foreground, theme.radius);
-        // Painted on the inner row, not the item: the item's hover color would otherwise cover it
-        // right after a click, when the pointer is still on the row.
-        let (theme_green, theme_magenta, theme_blue) = (theme.green, theme.magenta, theme.blue);
-        let selected = theme.blue.opacity(0.16);
-        let chosen = self.selected == Some(ix);
         let line = *self.lines.get(ix.row)?;
+        // The kit paints hover and selection on the item, from the list tokens the appearance
+        // setup points at the island surfaces. Painting a second fill here would double the tint.
         let row = move || {
-            let row = div()
+            div()
                 .w_full()
                 .h(rems(1.75))
                 .px_2()
@@ -277,8 +274,7 @@ impl ListDelegate for Targets {
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .min_w_0();
-            if chosen { row.bg(selected) } else { row }
+                .min_w_0()
         };
         let item = |id: (&'static str, usize)| ListItem::new(id).p_0().rounded(radius).text_sm();
         Some(match line {
@@ -303,12 +299,14 @@ impl ListDelegate for Targets {
                 item(("tree-folder", slot)).child(
                     row()
                         .child(chevron)
-                        .child(Icon::new(icon).small().text_color(muted))
+                        .child(Icon::new(icon).size_4().text_color(muted))
                         .child(
                             div()
                                 .flex_1()
+                                .min_w_0()
                                 .truncate()
                                 .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
                                 .child(FOLDERS[slot].title()),
                         )
                         .children((!empty).then(|| {
@@ -326,27 +324,22 @@ impl ListDelegate for Targets {
                 };
                 let id = row_id(&format!("{slot}/{label}"));
                 let inner = row()
-                    // Indented under the folder's icon, past its chevron.
-                    .pl_9()
+                    // One full level past the folder icon, so a child never shares its parent's
+                    // icon column. The group already names the type, so the icon stays neutral.
+                    .pl_12()
                     .child(
                         Icon::new(if closed {
                             IconName::EyeOff
                         } else {
                             FOLDERS[slot].icon()
                         })
-                        .small()
-                        // Open indices green, aliases purple, closed ones dimmed: the two folders
-                        // list similar names, so the icon color is what tells them apart.
-                        .text_color(match (closed, FOLDERS[slot]) {
-                            (true, _) => muted,
-                            (_, Folder::Indices) => theme_green,
-                            (_, Folder::Aliases) => theme_magenta,
-                            (_, Folder::Consoles) => theme_blue,
-                            _ => muted,
-                        }),
+                        .size_4()
+                        .text_color(muted),
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
                             .when(closed, |d| d.text_color(muted))
                             .child(SharedString::from(label.clone())),
