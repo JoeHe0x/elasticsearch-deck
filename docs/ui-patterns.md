@@ -1,0 +1,140 @@
+# 界面设计优化建议
+
+日期:2026-11-19。以下是对本项目界面的优化建议;涉及的 GPUI Kit API 已按 `gpui-kit = "=0.10.0"` 的源码复核。
+
+范围:与 PRD 已有条目(5.8 界面与体验、5.5 资源浏览、5.4 响应查看、5.9 多 Tab)对得上的才列入建议;不纳入本期的相邻能力列在 §3。
+
+## 1. 标题栏面包屑(首选)
+
+### 1.1 设计要点
+
+- 标题栏左边用一行面包屑回答「现在在哪」:`连接 › 目标 › 当前请求/Tab`。
+- 每段一个图标,段间用 `chevron-right` 分隔;名称过长时截断,不把标题栏撑开。
+- 能切换的那一段带下拉提示:连接段切换连接,目标段打开 REST Console / 复制名字。
+- 同一信息只在标题栏出现一次,树顶部不再重复连接名。
+
+### 1.2 本项目现状
+
+- 改造前,标题栏由 GPUI Kit 的 `TitleBar` 画(`crates/es-deck/src/console.rs:1911-1935`):Windows/Linux 先放菜单栏,然后是常用命令(`render_toolbar`,`console.rs:2064-2152`),右端是 ES 版本号和「连接名 + Database 图标 + 下拉」按钮。
+- 连接下拉已经能切换连接、新建、管理(`render_connection_crumb`,`console.rs:1976-2033`),和面包屑的「连接」段是同一件事。
+- 左侧树顶部已经有连接名和在线/离线点(`console.rs:2573` 附近),与标题栏的连接信息重复。
+- Tab 名:`Data Browser` 存成 `BROWSER_PREFIX + 目标名`,`REST Console` 存成用户给的 console 名(默认 `console`),见 `console.rs:1202-1289`。
+- 当前光标下的请求块已经能解析出 `method`/`path`(`es_dsl_core::request::{Block, block_at}`),`active_block` 目前只记了范围(`console.rs:348`、`446-453`)。
+
+### 1.3 建议方案
+
+把标题栏的连接按钮升级成面包屑,信息按当前 Tab 变化:
+
+```
+macOS:      [红绿灯]  [DB] dev-cluster ▸ [Table2] logs-2026.11 ▸ [SquareTerminal] GET logs-2026.11/_search      ……  [命令按钮]  8.19.0
+Windows/Linux: [菜单栏] [DB] dev-cluster ▸ [Table2] logs-2026.11 ▸ …                                          ……  [命令按钮]  8.19.0
+```
+
+- **连接段**:Database 图标 + 连接名,保留现在的下拉(切换 / Add / Manage)。连接断开或连不上时该段变灰或加危险色,替代树顶部那个点。
+- **目标/请求段**:
+  - Data Browser Tab:Table2 图标 + 索引或别名。点击弹菜单:`Open in REST Console`、`Copy name`,和树里的右键菜单同源。
+  - REST Console Tab:显示光标所在请求的 `METHOD path`(例如 `GET _cluster/health`),没有请求行时显示 console 名。这比只显示 console 名有信息量,也符合「路径」的直觉。
+- **可选第三段**:console 名(仅当第二段显示请求时)。已实现为只读段,尚未做成点击弹出已保存 console 列表;那需要复用现在的 `select_tab` 逻辑。
+- 连接不存在或未连接时,连接段显示 `Connect…` 并打开连接对话框,保持现有行为。
+- 左侧树顶部去掉连接名,只保留在线点和操作按钮,避免同一信息出现两次。
+
+### 1.4 落地要点
+
+- 0.10.0 自带 `gpui_component::breadcrumb::Breadcrumb`(`breadcrumb.rs`),但它只接受纯文本 label,没有图标、圆点和自定义 child。两种选择:
+  1. 用它做骨架,段与段之间自动加 `chevron-right`,但图标/圆点做不进去;
+  2. 在 `es-deck` 内拼一个小的 crumb 行(`div` + `Icon` + 截断 + `max_w`),与下面的结构一致。**推荐 2**,它只是布局组合,不是重写组件。
+- 点击区域必须 `on_mouse_down(MouseButton::Left, no_drag)`,否则和标题栏拖动冲突——现有连接按钮已经这么处理(`console.rs` 的 `no_drag`)。
+- 目标是 Data Browser 时从 `self.browsers` 取键;是普通 Tab 时用 `active_block` 重新解析 `Block`,不要每帧解析整篇文档。
+- 窄窗口下三段都要截断,连接名和目标名优先保留,console 段可以先隐藏(按宽度阈值)。
+- 改动集中在 `render_titlebar`,外加一个小函数 `fn crumb_label(&self) -> (String, …)`;不影响 `Library` 持久化和任何 es-client 逻辑。
+
+### 1.5 工作量
+
+小:半天左右(含无头测试断言 crumb 文本随 Tab 变化)。未渲染验证的红绿灯间距、截断观感要实际跑一次。
+
+### 1.6 实现状态
+
+两段式已实现(`render_crumbs`):连接段保留下拉切换,右侧加在线状态点(连不上时用危险色),树顶部不再有连接名和状态点。第二段有两个来源:在左树选中一行时显示该行的路径(`Nodes › n1`;文件夹行只显示文件夹名,索引/别名的名字段仍带打开 REST Console 与复制名字的菜单);否则 REST Console 显示 `console 名 › 光标所在请求行`(两段都有图标,请求行沿用编辑器同一套 token 配色与字重:method、路径、query 分别着色,没有请求行时只显示 console 名),Data Browser 显示索引/别名。单行选择、方向键移动、打开节点/索引、切换或重开 Tab 都会更新它;打开请求后标题栏回到请求行。树顶只剩右对齐的操作按钮,下方一条分割线。无头测试覆盖了目标段、请求行、树路径随选择变化、console 名与请求行两级以及重开请求后的标题栏,真实窗口渲染未验证。
+
+## 2. 其他可借鉴项
+
+| # | 能力 | 本项目对应 | 价值 | 工作量 | 建议 |
+|---|---|---|---|---|---|
+| 1 | 标题栏面包屑 | 标题栏 | 位置感、少一层点击 | S | **做**(§1) |
+| 2 | 命令面板 `⌘/Ctrl+K` | U3(键盘优先) | 索引/命令/连接统一入口 | M | **做**,0.10.0 自带 `Command` |
+| 3 | 状态栏连接信息 | V2 / U3 | 一眼看到连的是谁、什么身份、是否加密 | S | **做** |
+| 4 | Tab 管理 | E5 / 5.9 | 关闭其他/右侧、重开、拖拽排序 | M | 做 |
+| 5 | 树行元信息 | B1 | 索引的文档数/大小/健康 | M | 做(需要扩 `_cat/indices` 字段) |
+| 6 | 树的加载/失败/空态行 | B1 / U4 | 连接慢或失败时不是空白 | S | 做 |
+| 7 | 结果表格右键菜单 | V3 / V6 | 复制单元格、列名、所选行为 CSV/JSON | S–M | 做(复制),导出属 V6 另行确认 |
+| 8 | 会话恢复 | 5.9 持久化 | 窗口大小、面板开合、当前 Tab | S | 做 |
+| 9 | 生产连接标记 | S3 只读模式 | 防止在生产集群误操作 | S | 建议(见 §2.7) |
+| 10 | 空态引导卡片 | U5/U6 | 首次打开的落点 | S | 可做,现有空态已够用 |
+| 11 | 键帽提示 | U3 | 快捷键可发现 | S | 随命令面板一起做 |
+
+### 2.1 命令面板(最大的单项收益)
+
+命令面板把连接、索引、已保存 console、命令、当前 Tab 切换都做成同一种条目,分组显示,每行可带图标、提示和快捷键;上下键移动、回车执行、Esc 关闭。对我们最合适的条目集:
+
+- 连接:切换、新建、管理。
+- 目标:每个索引/别名,回车开 Data Browser,`⌘Enter` 开 REST Console(和树的右键菜单一致)。
+- 已保存 console:切换。
+- 命令:发送当前请求、取消、格式化、历史、设置、主题、显示/隐藏树、断开连接、复制当前请求。
+- 最近历史:按文本搜索后插入编辑器(可选,受 H1 范围)。
+
+0.10.0 自带 `gpui_component::command::{Command, CommandState, CommandGroup, CommandItem}`,条目可以绑 `Action` 并自动显示键位提示;`on_confirm(IndexPath)` 能拿到条目坐标,按坐标路由即可。宿主放进现有 `window.open_dialog` 或一个自绘 `occlude` 覆盖层;`Command` 的 `on_cancel` 文档写明应由宿主 Dialog 负责关闭。入口:标题栏中央或工具栏按钮 + `Cmd/Ctrl+K`,菜单里也加一项。
+
+### 2.2 状态栏
+
+状态栏约 22px,左边 `● 连接名 · ES 版本`,中间 `host`、`HTTPS`、`Basic / API Key`,右边 `N hits · ms`。我们的 `render_status`(`console.rs:2155-2237`)已经有响应状态、耗时、大小、JSON 路径、只读徽标和问题数,缺的是连接身份:连接名、URL 的 host(不含凭据)、认证方式、ES 版本。注意 CLAUDE.md 的凭据规则:URL 只能显示 host,不能带 userinfo 或 API Key。
+
+### 2.3 Tab 管理
+
+Tab 条可以有 `+ 新建`、拖拽排序、右上角「重开已关闭的 Tab」;右键菜单是 Close / Close Others / Close Tabs to the Right。我们只需要:`+` 新建 console、拖拽排序、重开最近关闭的 Tab。右键菜单目前有 Rename/Delete(`console.rs:1278`),可补 Close Others 和 Close to the Right。
+
+### 2.4 树
+
+- 行右侧的灰色 meta(如 `1.2M docs · 340 MB`):索引行显示文档数与大小、关闭索引显示 `closed`(PRD B1)。现在 `_cat/indices` 只取了 `index,status`(`es-client/src/meta.rs:61`),要加 `health,docs.count,store.size`,并在 `Row` 上加字段——会牵动 `es-client` 的解析和测试,故估 M。
+- 加载/失败/空态行:连接中显示 `loading…`,失败显示可点击的 `Connection failed`,没连显示 `Connect to browse…`。我们的树在未连接时整个侧栏都不在(`render` 里 `self.http.is_some()`),所以这条价值中等。
+- 键盘:树可以用 `tab_group` + `focus_next/focus_prev`;我们的树是 Kit 的 `ListState`,本身已有上下键和 `Confirm`,不必改。
+
+### 2.5 结果表格
+
+- 表头右键:`Copy column name`、按该列排序、隐藏列。我们的 `HitsTable::context_menu`(`hits_table.rs:170-183`)只给了整行 `Copy row as JSON`,因为 0.10.0 的 `TableDelegate::context_menu` 只给 `row_ix`。要复制单元格,需要在 `render_td` 里给单元格自己挂 `context_menu`(或先做单元格选中),工作量 S–M。
+- 行/选区导出 CSV/JSON:右键菜单和底栏都可以有,我们按 PRD V6 属 P1、不在本期,先把「复制」做好。
+
+### 2.6 会话恢复
+
+会话恢复要存窗口 bounds、树与响应区的开合及尺寸、当前 Tab。我们的 `Library` 已经按连接保存 console 文本;缺窗口大小、面板开合和「上次激活的 Tab」。这与 PRD 5.9「重启后恢复 Tab」一致,建议补齐;文件格式沿用现有 `saved.json` 的写法。
+
+### 2.7 生产/只读标记
+
+可以给连接设颜色、把连接标成生产、危险操作用醒目配色。我们的 `readonly` 是全局开关,不区分连接。建议给连接配置加一个「生产」标记,开启后默认只读并在标题栏/状态栏用醒目颜色;这是 PRD S3 的自然延伸,但要先确认是否算范围变化。
+
+## 3. 不纳入本期
+
+| 能力 | 理由 |
+|---|---|
+| 文档新增、删除、编辑单元格 | PRD 5.9 明确只读 |
+| 导入数据、导出 CSV/JSON 文件 | 导出属 V6(P1),导入不在 PRD |
+| 聚合/`_profile` 结果的高级分析面板 | PRD V5 只到聚合结果表格(P2) |
+| 分屏 | PRD 没有 |
+| AI 面板、自动更新、插件 | PRD 非目标 / 未在范围 |
+| SSH 隧道 | PRD C6 为 P2 |
+| 连接文件夹、颜色分组 | PRD 未提;可作后续开放问题 |
+| 自建主题 token 体系 | 我们已有 `surface.rs` / `appearance.rs`,跟随 Kit 主题 |
+
+## 4. 建议顺序
+
+1. 标题栏面包屑(§1)+ 状态栏连接信息(§2.2):改动小、和现有标题栏/状态栏同一处。
+2. 命令面板(§2.1)和键帽提示(表格第 11 项):U3 的核心;面板入口放标题栏。
+3. Tab 管理(§2.3)、会话恢复(§2.6)。
+4. 树行元信息(§2.4,需要动 `es-client`)、表格复制菜单(§2.5)。
+5. 生产标记(§2.7)先确认范围再动。
+
+## 5. 未验证
+
+- 没有运行任何 UI,界面细节(间距、动画、菜单弹出位置)来自代码审阅,不是实测。
+- 没有渲染本项目的面包屑/命令面板;0.10.0 的 `Breadcrumb`、`Command` 观感、`TitleBar` 在三种平台下的可用宽度都未实测。
+- 标题栏面包屑在 1200px 以下窗口的截断策略、macOS 红绿灯左侧 80px 与 Windows/Linux 菜单栏的排布,需要实际跑一次再定。
+- 树行元信息依赖 `_cat/indices` 的 `health,docs.count,store.size` 在 7.x/8.x 的返回格式,尚未对照真实集群。
