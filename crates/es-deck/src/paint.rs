@@ -4,20 +4,19 @@
 use std::cell::RefCell;
 use std::ops::Range;
 
-use es_dsl_core::{Token, block_spans, json_tokens, tokens};
+use es_dsl_core::{Token, json_tokens, tokens};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{
-    EditorState, GutterDecoration, GutterDecorationCollection, RangeDecoration,
-    RangeDecorationCollection, TextDecoration, TextDecorationCollection,
+    EditorState, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, TextDecoration,
+    TextDecorationCollection,
 };
 use gpui_kit::{App, Entity, FontWeight, HighlightStyle, Hsla, rgb};
 
 pub struct Paint {
     colors: TextDecorationCollection,
-    bars: GutterDecorationCollection,
-    /// A frame around the request the cursor is in.
+    /// A tint behind the request the cursor is in.
     active: RangeDecorationCollection,
-    /// A response body: plain JSON, with no request lines or bars.
+    /// A response body: plain JSON, with no request lines.
     json_only: bool,
     /// Keys the user chose, from the last schema-aware pass; they lag edits until the next one.
     custom: RefCell<Vec<(Range<usize>, Token)>>,
@@ -60,7 +59,6 @@ impl Paint {
             json_only,
             custom: RefCell::default(),
             colors: state.create_decorations_collection(Vec::new(), cx),
-            bars: state.create_gutter_decorations_collection(Vec::new(), cx),
             active: state.create_range_decorations_collection(Vec::new(), cx),
         })
     }
@@ -74,7 +72,6 @@ impl Paint {
     /// Recomputes every span; call after each edit (the ranges would follow edits, but not re-classify).
     pub fn refresh(&self, text: &str, cx: &mut App) {
         let theme = cx.theme();
-        let accent = theme.blue;
         let dark = theme.is_dark();
         let custom = self.custom.borrow();
         let spans = if self.json_only {
@@ -92,24 +89,20 @@ impl Paint {
                 TextDecoration::new(range, style(token, dark))
             })
             .collect();
-        let bars = if self.json_only {
-            Vec::new()
-        } else {
-            block_spans(text)
-        }
-        .into_iter()
-        .map(|range| GutterDecoration::new(range).with_color(accent))
-        .collect();
         self.colors.set(colors, cx);
-        self.bars.set(bars, cx);
     }
 
-    /// Frames `block`, or clears the frame. Callers skip unchanged ranges: setting notifies the editor.
-    /// The theme's accent follows light and dark; the editor's fallback is the foreground colour,
-    /// which is too heavy for a whole request.
+    /// Tints `block`, or clears the tint. Callers skip unchanged ranges: setting notifies the editor.
+    /// A frame would follow each line's own width and step along the request's ragged right edge,
+    /// so the request is filled instead; the purple is light enough to sit behind the text colors.
     pub fn set_active(&self, block: Option<Range<usize>>, cx: &mut App) {
-        let color = cx.theme().blue.opacity(0.7);
-        let frame = block.map(|r| RangeDecoration::new(r).with_color(color));
-        self.active.set(frame.into_iter().collect(), cx);
+        let alpha = if cx.theme().is_dark() { 0.18 } else { 0.10 };
+        let color = Hsla::from(rgb(0x8B5CF6)).opacity(alpha);
+        let tint = block.map(|r| {
+            RangeDecoration::new(r)
+                .with_style(RangeDecorationStyle::Fill)
+                .with_color(color)
+        });
+        self.active.set(tint.into_iter().collect(), cx);
     }
 }
