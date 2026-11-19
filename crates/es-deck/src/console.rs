@@ -365,6 +365,8 @@ pub struct Console {
     crumbs: Vec<es_dsl_core::Seg>,
     /// The request under the cursor, as framed in the editor.
     active_block: Option<Range<usize>>,
+    /// Text length when the tint was set; the editor stretches a range when text is typed at its end.
+    active_len: usize,
     /// The request line under the cursor, as the title bar's context crumb shows it.
     request_line: SharedString,
     /// The caret the last editor notification reported, to tell a real move from a repaint.
@@ -483,9 +485,10 @@ impl Console {
                 .or_else(|| spans.first())
                 .cloned();
             let line = block_request_line(&text, block.as_ref());
-            if block != this.active_block {
+            if block != this.active_block || text.len() != this.active_len {
                 this.paint.set_active(block.clone(), cx);
                 this.active_block = block;
+                this.active_len = text.len();
             }
             if crumbs != this.crumbs {
                 this.crumbs = crumbs;
@@ -675,6 +678,7 @@ impl Console {
             problems: None,
             crumbs: Vec::new(),
             active_block: None,
+            active_len: 0,
             request_line,
             caret: 0,
             tree_crumb: None,
