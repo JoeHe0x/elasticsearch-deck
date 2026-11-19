@@ -1345,6 +1345,9 @@ impl Console {
             self.panes.remove(&closed);
         }
         if closed_active {
+            // The tab is gone: while it is still `active`, the next save would store the editor's
+            // text as a console named after it, and a closed Data Browser would show up in the tree.
+            self.active.clear();
             self.select_tab(ix.saturating_sub(1), cx);
         } else {
             cx.notify();
@@ -4105,6 +4108,43 @@ mod tests {
                 &*console.request_line, "GET _nodes/n1",
                 "the title bar names the request the click opened"
             );
+        });
+    }
+
+    /// Closing a Data Browser tab must not leave a saved console named after it: the editor still
+    /// holds the console that the browser replaced, and that text is what a save would store.
+    #[gpui_kit::test]
+    fn closing_a_data_browser_saves_no_console_for_it(cx: &mut TestAppContext) {
+        let (window, console) = console_window(cx);
+        let (editor, library) = cx.update(|cx| {
+            let console = console.read(cx);
+            (console.editor.clone(), console.library.clone())
+        });
+        let http = Arc::new(Client::new(es_client::Config::new("http://127.0.0.1:1")).unwrap());
+        let browser = cx
+            .update_window(window, |_, window, cx| {
+                window.activate_window();
+                editor.update(cx, |state, cx| state.set_value("GET _cat/health", window, cx));
+                console.update(cx, |this, _| {
+                    this.summary = Some(Summary {
+                        name: "c1".into(),
+                        version: "".into(),
+                    });
+                });
+                cx.new(|cx| DataBrowser::new("logs".into(), http.clone(), None, window, cx))
+            })
+            .unwrap();
+        cx.update(|cx| {
+            console.update(cx, |this, cx| {
+                this.tabs = vec![saved::AUTO_CONSOLE.into(), "table:logs".into()];
+                this.active = "table:logs".into();
+                this.browsers.insert("table:logs".into(), browser);
+                this.close_tab(1, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(library.read(cx).console("c1", "table:logs").is_none());
         });
     }
 
