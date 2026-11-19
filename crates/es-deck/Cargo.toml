@@ -24,3 +24,15 @@ httpmock = "0.9"
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
+
+[package.metadata.packager]
+product-name = "elasticsearch-deck"
+identifier = "dev.joehe0x.es-deck"
+icons = ["assets/icon.png", "assets/icon.ico"]
+formats = ["deb", "appimage", "nsis"]
+description = "Elasticsearch desktop client with REST API and Query DSL completion"
+authors = ["JoeHe0x <894598156@qq.com>"]
+
+[package.metadata.packager.deb]
+# Shared libs found with ldd; libraries GPUI loads with dlopen (Wayland, Vulkan) are not covered.
+depends = ["libc6", "libxcb1", "libxcb-xkb1", "libxkbcommon0", "libxkbcommon-x11-0"]

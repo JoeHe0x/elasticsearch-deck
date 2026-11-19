@@ -112,6 +112,21 @@ On first launch, choose **Connect…** in the title bar and enter the cluster UR
 method and optional TLS settings. The schema index for the cluster version is fetched on connect and
 cached, so later launches do not download it again.
 
+### Package an installer
+
+Packaging uses [`cargo-packager`](https://github.com/crabnebula-dev/cargo-packager); its config is
+`[package.metadata.packager]` in `crates/es-deck/Cargo.toml`. Only Linux (`.deb`, AppImage) has been
+tried so far; macOS, Windows and code signing are untested.
+
+```bash
+cargo install cargo-packager --locked
+cargo build --release -p es-deck
+cd crates/es-deck && cargo packager --release   # artifacts land in target/release/
+```
+
+The AppImage step needs every shared library of the binary (`ldd target/release/es-deck`) to be
+resolvable, otherwise linuxdeploy fails with `Could not find dependency`.
+
 ### Shortcuts
 
 | Action | macOS | Windows / Linux |

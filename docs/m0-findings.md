@@ -355,3 +355,28 @@ Re-checked in the 0.10.0 sources, because the rest of this document was written 
 
 Not verified: nothing was rendered, so visual changes the kit made in 0.10.0 are not known to us; no changelog ships in the
 published crate, and only the APIs this project uses were inspected. The upgrade commit is separate, as CLAUDE.md requires.
+
+## Installer packaging (survey, no code yet)
+
+Today the app ships only as a bare `cargo build --release` binary. Survey order per CLAUDE.md: repo -> GPUI Kit -> standard tooling -> third-party -> hand-written. The repo and GPUI Kit have no packaging support; the options below are third-party cargo subcommands (checked via crates.io and GitHub READMEs on 2026-11-19).
+
+| Tool | Version / last crates.io update | License | Formats | Signing |
+|---|---|---|---|---|
+| `cargo-packager` (crabnebula-dev) | 0.11.8, 2025-11-27 | Apache-2.0 OR MIT | macOS `.app`/`.dmg`; Windows NSIS `.exe` and WiX `.msi`; Linux `.deb`, AppImage, pacman. No `.rpm` listed | macOS signing identity, notarization credentials and entitlements exist in `MacOsConfig`; Windows signing not verified |
+| `cargo-bundle` (burtonageo) | 0.12.0, 2026-09-20 | MIT OR Apache-2.0 (optional Windows signing feature vendors GPL-3.0-or-later `osslsigncode`) | macOS `.app`/`.dmg`; Windows `.msi`; Linux `.deb`, `.rpm`, AppImage | macOS signed in-process, explicitly does not notarize; Windows signing is opt-in |
+
+Notes:
+- `cargo-packager` does not build the app; it needs a `before-packaging-command` (e.g. `cargo build --release`). Config can live in `[package.metadata.packager]`, so no new file format is forced on us.
+- `cargo-bundle` README calls itself "very early alpha" with an unstable metadata format; it also contradicts itself on `.rpm`.
+- `cargo-packager` has been quiet on crates.io for about a year; treat maintenance as unverified (GitHub commit dates were not retrievable).
+- Not verified: that either tool works with a GPUI binary (icon, `assets/` resources, Windows `icon.rc` embed), Windows signing options for `cargo-packager`, and any trademark constraint on the installer name (see CLAUDE.md).
+
+Leaning: try `cargo-packager` first (one tool, notarization support), fall back to `cargo-bundle` if it fails on GPUI. Decide after a spike on one platform; do not write per-platform scripts by hand unless both fail.
+
+Open product questions (not decided here): target platforms/formats for first release, whether to sign (needs Apple Developer / Windows code-signing certs), and auto-update (out of PRD scope unless added).
+
+Spike result (Linux/WSL, `cargo packager --release` in `crates/es-deck`, config in `[package.metadata.packager]`):
+- `.deb`: works (`target/release/es-deck_0.1.0_amd64.deb`, binary 80 MB, deb 24 MB). Maintainer, Description and `Depends` (from `ldd`) are set in the config; the `Depends` list does not cover libraries loaded with dlopen (Wayland, Vulkan). Not installed or launched.
+- AppImage: works (`es-deck_0.1.0_x86_64.AppImage`, 22 MB) once linuxdeploy can resolve every shared lib. The earlier failure was this box lacking `libxkbcommon-x11.so.0` and `libxcb-xkb.so.1`; linuxdeploy needs them on `LD_LIBRARY_PATH` at packaging time. Launch smoke test under WSLg only printed Mesa/EGL warnings for 10 s; window not confirmed.
+- Not tried: macOS, Windows, signing.
+- The bundled index is embedded via `include_bytes!`, so packages need no extra resource files; other ES versions are downloaded at runtime.
