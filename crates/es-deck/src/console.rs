@@ -82,6 +82,7 @@ actions!(
         Send,
         Format,
         Newline,
+        AcceptCompletion,
         CancelRequest,
         ToggleTree,
         ToggleReadonly,
@@ -194,6 +195,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(SEND_KEY, Send, Some("Input")),
         KeyBinding::new(FORMAT_KEY, Format, Some("Input")),
         KeyBinding::new("enter", Newline, Some("Input")),
+        KeyBinding::new("tab", AcceptCompletion, Some("Input")),
         KeyBinding::new(
             "ctrl-space",
             ShowCompletions,
@@ -712,6 +714,17 @@ impl Console {
 
     /// Enter takes the highlighted suggestion; with no menu open it is a plain newline.
     fn newline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_suggestion(window, cx);
+    }
+
+    /// Tab takes the highlighted suggestion like Enter; with no menu open it indents as before.
+    fn accept_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_suggestion(window, cx);
+    }
+
+    /// Inserts the highlighted suggestion when the menu is open; otherwise the key goes on to the
+    /// kit's own handler.
+    fn take_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_menu(window, cx) == Some(true) {
             let enter = Enter {
                 secondary: false,
@@ -722,8 +735,8 @@ impl Console {
             });
             if taken {
                 // The menu propagates while accepting so a key it ignores still reaches the
-                // editor. Here it took the key: without this the same Enter would also run the
-                // kit's newline and split the line under the inserted completion.
+                // editor. Here it took the key: without this the same key would also run the
+                // kit's newline or indent and change the line under the inserted completion.
                 cx.stop_propagation();
                 return;
             }
@@ -3310,6 +3323,9 @@ impl Render for Console {
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Format, window, cx| this.format(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| this.newline(window, cx)))
+            .on_action(cx.listener(|this, _: &AcceptCompletion, window, cx| {
+                this.accept_completion(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &CancelRequest, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(-1, cx)))
@@ -3521,7 +3537,19 @@ mod tests {
     /// Real editor, real provider, real server: typing a key prefix opens the menu and Enter inserts the key.
     #[gpui_kit::test]
     fn typing_a_key_prefix_completes_through_the_lsp(cx: &mut TestAppContext) {
+        completes_with(cx, "enter");
+    }
+
+    /// Tab takes the highlighted suggestion exactly as Enter does.
+    #[gpui_kit::test]
+    fn tab_accepts_the_highlighted_completion(cx: &mut TestAppContext) {
+        completes_with(cx, "tab");
+    }
+
+    fn completes_with(cx: &mut TestAppContext, key: &'static str) {
         cx.update(gpui_kit::init);
+        // The app's own bindings, so Enter and Tab reach the console's handlers as they do there.
+        cx.update(bind_keys);
         let client = LspClient::start(sample_index(), None, es_dsl_core::NoFields).unwrap();
         let (window, console) = cx
             .update(|cx| {
@@ -3567,7 +3595,7 @@ mod tests {
         })
         .unwrap();
 
-        cx.update_window(window, |_, window, cx| window.press("enter", cx))
+        cx.update_window(window, |_, window, cx| window.press(key, cx))
             .unwrap();
         cx.run_until_parked();
         let value = cx.update(|cx| editor.read(cx).value().to_string());
