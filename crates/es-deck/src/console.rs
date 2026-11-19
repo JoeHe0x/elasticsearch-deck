@@ -4124,7 +4124,9 @@ mod tests {
         let browser = cx
             .update_window(window, |_, window, cx| {
                 window.activate_window();
-                editor.update(cx, |state, cx| state.set_value("GET _cat/health", window, cx));
+                editor.update(cx, |state, cx| {
+                    state.set_value("GET _cat/health", window, cx)
+                });
                 console.update(cx, |this, _| {
                     this.summary = Some(Summary {
                         name: "c1".into(),
