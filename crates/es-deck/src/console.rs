@@ -129,7 +129,7 @@ fn view_menu(pref: Pref, readonly: bool, settings: bool) -> Menu {
         items.push(MenuItem::separator());
         items.push(MenuItem::action("Settings…", OpenSettings));
     }
-    Menu::new("View").items(items)
+    Menu::new("Tools").items(items)
 }
 
 fn help_menu() -> Menu {
@@ -137,7 +137,7 @@ fn help_menu() -> Menu {
 }
 
 /// The macOS application menu. AppKit shows the first menu under the application's name; without
-/// one, the first menu (`View`) is taken for it and loses its title, leaving only `Help` beside
+/// one, the first menu (`Tools`) is taken for it and loses its title, leaving only `Help` beside
 /// the Apple menu.
 #[cfg(target_os = "macos")]
 fn application_menu() -> Menu {
@@ -164,7 +164,7 @@ fn platform_menus(pref: Pref, readonly: bool) -> Vec<Menu> {
     #[cfg(target_os = "macos")]
     {
         let mut menus = vec![application_menu()];
-        // Settings has a home in the application menu; a second copy in View would duplicate it.
+        // Settings has a home in the application menu; a second copy in Tools would duplicate it.
         menus.extend([view_menu(pref, readonly, false), help_menu()]);
         menus
     }
@@ -2262,7 +2262,9 @@ impl Console {
             // macOS draws the menus in the screen's menu bar; a second copy here would repeat
             // every command inside the window.
             .when(!cfg!(target_os = "macos"), |this| {
-                this.child(self.menu_bar.clone())
+                // AppMenuBar is `size_full`; flex_none keeps it at its content width so it
+                // does not take the row and push the crumbs against the toolbar.
+                this.child(div().flex_none().child(self.menu_bar.clone()))
             })
             .child(self.render_crumbs(cx))
             .child(div().flex_1())
@@ -4964,13 +4966,13 @@ mod tests {
         assert_eq!(menu_checked(cx, "Readonly"), Some(false));
     }
 
-    /// Whether the View menu item called `name` is checked, from the platform menu bar.
+    /// Whether the Tools menu item called `name` is checked, from the platform menu bar.
     fn menu_checked(cx: &mut TestAppContext, name: &str) -> Option<bool> {
         cx.update(|cx| {
             cx.get_menus()
                 .unwrap_or_default()
                 .into_iter()
-                .find(|menu| menu.name == "View")
+                .find(|menu| menu.name == "Tools")
                 .and_then(|menu| {
                     menu.items.into_iter().find_map(|item| match item {
                         gpui_kit::OwnedMenuItem::Action {
@@ -4984,7 +4986,7 @@ mod tests {
         })
     }
 
-    /// The View menu actions change the theme immediately and remember the choice.
+    /// The Tools menu actions change the theme immediately and remember the choice.
     #[gpui_kit::test]
     fn choosing_an_appearance_applies_and_remembers_it(cx: &mut TestAppContext) {
         let (window, console) = console_window(cx);
@@ -5014,7 +5016,7 @@ mod tests {
     }
 
     /// Settings opens from its command, reads the console's current choice, and writes the next
-    /// one through the console — the same path the View menu takes.
+    /// one through the console — the same path the Tools menu takes.
     #[gpui_kit::test]
     fn the_settings_dialog_changes_the_appearance(cx: &mut TestAppContext) {
         // A directory of its own: the appearance file sits beside the connections file, and the
@@ -5063,7 +5065,7 @@ mod tests {
     }
 
     /// The native menu starts with the application menu, so the command menus keep their titles.
-    /// Settings lives in the application menu; a second copy in View would duplicate it.
+    /// Settings lives in the application menu; a second copy in Tools would duplicate it.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_macos_menu_bar_starts_with_the_application_menu() {
@@ -5079,7 +5081,7 @@ mod tests {
 
         let menus = platform_menus(Pref::System, false);
         let names: Vec<_> = menus.iter().map(|menu| menu.name.to_string()).collect();
-        assert_eq!(names, [APP_NAME, "View", "Help"]);
+        assert_eq!(names, [APP_NAME, "Tools", "Help"]);
         let app = actions(&menus[0]);
         assert!(app.iter().any(|name| name == "About elasticsearch-deck"));
         assert!(app.iter().any(|name| name == "Settings…"));
